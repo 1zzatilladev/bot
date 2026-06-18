@@ -1,0 +1,80 @@
+[
+  {
+    "key": "cbu",
+    "name": "CBU (O'zbekiston MB)",
+    "type": "official",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "cbu_api",
+      "url": "https://cbu.uz/uz/arkhiv-kursov-valyut/json/"
+    }
+  },
+  {
+    "key": "wise",
+    "name": "Wise",
+    "type": "card",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "wise_api"
+    }
+  },
+  {
+    "key": "unirateapi",
+    "name": "UniRateAPI",
+    "type": "market",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "unirateapi_rates"
+    }
+  },
+  {
+    "key": "koronapay",
+    "name": "Koronapay",
+    "type": "card",
+    "pairs": ["RUB_UZS"],
+    "fetch": {
+      "method": "koronapay_api",
+      "receiving_method": "cash"
+    }
+  },
+  {
+    "key": "aloqabank",
+    "name": "Aloqabank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "themoney_bank",
+      "url": "https://themoney.uz/banks/aloqa-bank/rub/"
+    }
+  },
+  {
+    "key": "ipotekabank",
+    "name": "Ipoteka-bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "themoney_bank",
+      "url": "https://themoney.uz/banks/ipoteka-bank/rub/"
+    }
+  },
+  {
+    "key": "agrobank",
+    "name": "Agrobank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "themoney_bank",
+      "url": "https://themoney.uz/uz/banks/agro-bank/rub/"
+    }
+  },
+  {
+    "key": "hamkorbank",
+    "name": "Hamkorbank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "themoney_bank",
+      "url": "https://themoney.uz/banks/hamkorbank/rub/"
+    }
+  }
+]
