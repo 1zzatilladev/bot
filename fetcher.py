@@ -599,50 +599,6 @@ async def _scrape_bank_html(
     return None
 
 
-async def _fetch_themoney_bank_page(
-    session: aiohttp.ClientSession,
-    url: str,
-) -> Optional[tuple[Optional[float], Optional[float]]]:
-    """
-    themoney.uz/banks/{slug}/rub/ sahifasidan buy/sell kurslarini oladi.
-    Sahifada 3 ta bold span: [0]=buy, [1]=sell, [2]=CBU rasmiy kurs.
-    Qaytaradi: (buy, sell) — biri None bo'lishi mumkin.
-    """
-    try:
-        async with session.get(url, headers=HEADERS, timeout=TIMEOUT) as r:
-            if r.status != 200:
-                log.debug("themoney bank page %s → HTTP %d", url, r.status)
-                return None
-            html = await r.text(errors="replace")
-
-        soup = BeautifulSoup(html, _PARSER)
-
-        rate_spans = soup.find_all(
-            "span",
-            class_=lambda c: c and "text-2xl" in c and "font-bold" in c,
-        )
-
-        nums: list[Optional[float]] = []
-        for s in rate_spans[:2]:
-            text = s.get_text(strip=True).replace(",", ".").replace("\xa0", "")
-            try:
-                val = float(text)
-                nums.append(val if 10 < val < 5000 else None)
-            except ValueError:
-                nums.append(None)
-
-        buy  = nums[0] if len(nums) > 0 else None
-        sell = nums[1] if len(nums) > 1 else None
-
-        if buy is not None or sell is not None:
-            return buy, sell
-        return None
-
-    except Exception as e:
-        log.debug("themoney bank page (%s): %s", url, e)
-    return None
-
-
 # ---------------------------------------------------------------------------
 # KORONAPAY API — RUB->UZS o'tkazma kursi (tasdiqlangan endpoint)
 # ---------------------------------------------------------------------------
@@ -928,234 +884,6 @@ async def _fetch_wise_api(
 
 
 # ---------------------------------------------------------------------------
-# UNIRATEAPI — forex mid-market kurslari (USD orqali cross-rate)
-# ---------------------------------------------------------------------------
-
-async def _fetch_unirateapi(
-    session: aiohttp.ClientSession,
-    pairs: list[str],
-) -> dict[str, float]:
-    """
-    UniRateAPI dan USD orqali RUB_UZS cross-kursini hisoblaydi.
-    from=USD → rates["UZS"] / rates["RUB"] = RUB_UZS
-    API kaliti UNIRATEAPI_KEY env o'zgaruvchisida bo'lishi kerak.
-    """
-    api_key = os.environ.get("UNIRATEAPI_KEY", "")
-    if not api_key:
-        log.warning("UniRateAPI: UNIRATEAPI_KEY env topilmadi")
-        return {}
-
-    results: dict[str, float] = {}
-    try:
-        async with session.get(
-            "https://api.unirateapi.com/api/rates",
-            params={"api_key": api_key, "from": "USD"},
-            headers=HEADERS, timeout=TIMEOUT,
-        ) as r:
-            if r.status != 200:
-                log.warning("UniRateAPI: HTTP %d", r.status)
-                return {}
-            data = await r.json(content_type=None)
-
-        rates = data.get("rates", {})
-        uzs_per_usd = float(rates.get("UZS") or 0)
-        rub_per_usd = float(rates.get("RUB") or 0)
-
-        if uzs_per_usd > 0 and rub_per_usd > 0:
-            rub_uzs = uzs_per_usd / rub_per_usd
-            if "RUB_UZS" in pairs:
-                results["RUB_UZS"] = rub_uzs
-            if "UZS_RUB" in pairs:
-                results["UZS_RUB"] = 1.0 / rub_uzs
-            log.info(
-                "UniRateAPI: RUB_UZS=%.4f (UZS/USD=%.2f, RUB/USD=%.4f)",
-                rub_uzs, uzs_per_usd, rub_per_usd,
-            )
-    except Exception as e:
-        log.warning("UniRateAPI: %s", e)
-    return results
-
-
-# ---------------------------------------------------------------------------
-# COINBASE MPAY — CoinGecko orqali MPAY/USD → RUB_UZS cross-rate
-# ---------------------------------------------------------------------------
-
-async def _fetch_coinbase_mpay(
-    session: aiohttp.ClientSession,
-    pairs: list[str],
-) -> dict[str, float]:
-    """
-    coinbase.com/converter/mpay/uzs manbasiga asosan MPAY token kurslari oladi.
-    Coinbase API MPAY'ni bloklaydi → CoinGecko (id: mmp-pay) ishlatiladi.
-    MPAY/USD (CoinGecko) + USD/UZS, USD/RUB (UniRateAPI) → RUB_UZS hisoblash.
-    """
-    api_key = os.environ.get("UNIRATEAPI_KEY", "")
-    results: dict[str, float] = {}
-    try:
-        # 1) CoinGecko: MPAY token narxi USD va RUB da
-        async with session.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "mmp-pay", "vs_currencies": "usd,rub"},
-            headers={**HEADERS, "Accept": "application/json"},
-            timeout=TIMEOUT,
-        ) as r:
-            if r.status != 200:
-                log.warning("CoinGecko MPAY: HTTP %d", r.status)
-                return {}
-            gecko = await r.json(content_type=None)
-
-        mpay_usd = float((gecko.get("mmp-pay") or {}).get("usd") or 0)
-        mpay_rub = float((gecko.get("mmp-pay") or {}).get("rub") or 0)
-
-        if mpay_usd <= 0 or mpay_rub <= 0:
-            log.warning("CoinGecko MPAY: narx topilmadi")
-            return {}
-
-        # 2) UniRateAPI: USD/UZS olish
-        if not api_key:
-            log.warning("CoinGecko MPAY: UNIRATEAPI_KEY yo'q — UZS hisoblash mumkin emas")
-            return {}
-
-        async with session.get(
-            "https://api.unirateapi.com/api/rates",
-            params={"api_key": api_key, "from": "USD"},
-            headers=HEADERS, timeout=TIMEOUT,
-        ) as r:
-            if r.status != 200:
-                return {}
-            uni = await r.json(content_type=None)
-
-        usd_uzs = float((uni.get("rates") or {}).get("UZS") or 0)
-        if usd_uzs <= 0:
-            return {}
-
-        # MPAY/UZS = mpay_usd × usd_uzs
-        # RUB_UZS = MPAY_UZS / MPAY_RUB
-        mpay_uzs = mpay_usd * usd_uzs
-        rub_uzs  = mpay_uzs / mpay_rub
-
-        if "RUB_UZS" in pairs and 50 < rub_uzs < 500:
-            results["RUB_UZS"] = rub_uzs
-            log.info(
-                "Coinbase MPAY (CoinGecko): RUB_UZS=%.4f "
-                "(MPAY/USD=%.2e, MPAY/RUB=%.6f, USD/UZS=%.2f)",
-                rub_uzs, mpay_usd, mpay_rub, usd_uzs,
-            )
-    except Exception as e:
-        log.warning("Coinbase MPAY: %s", e)
-    return results
-
-
-# ---------------------------------------------------------------------------
-# BANK RASMIY JSON API → HTML FALLBACK
-# ---------------------------------------------------------------------------
-
-def _parse_rate_val(v: object) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        val = float(str(v).replace(",", ".").replace(" ", "").replace("\xa0", ""))
-        return val if 10 < val < 5000 else None
-    except (ValueError, TypeError):
-        return None
-
-
-def _parse_json_for_rub(data: object) -> Optional[tuple[Optional[float], Optional[float]]]:
-    """Har qanday JSON strukturasidan RUB buy/sell topadi (rekursiv)."""
-    if isinstance(data, list):
-        for item in data:
-            r = _parse_json_for_rub(item)
-            if r:
-                return r
-        return None
-    if not isinstance(data, dict):
-        return None
-    ccy = str(
-        data.get("ccy") or data.get("currency") or data.get("code") or
-        data.get("charCode") or data.get("name") or data.get("title") or ""
-    ).upper()
-    if "RUB" in ccy:
-        buy  = _parse_rate_val(
-            data.get("buy") or data.get("purchase") or
-            data.get("buyRate") or data.get("buy_rate") or data.get("in")
-        )
-        sell = _parse_rate_val(
-            data.get("sell") or data.get("sale") or
-            data.get("sellRate") or data.get("sell_rate") or data.get("out")
-        )
-        if buy or sell:
-            return buy, sell
-    for v in data.values():
-        if isinstance(v, (dict, list)):
-            r = _parse_json_for_rub(v)
-            if r:
-                return r
-    return None
-
-
-async def _fetch_bank_json_api(
-    session: aiohttp.ClientSession,
-    api_urls: list[str],
-    html_urls: list[str],
-) -> Optional[tuple[Optional[float], Optional[float]]]:
-    """
-    Bank rasmiy JSON API → inline JSON → HTML jadval ketma-ket urinadi.
-    api_urls: rasmiy API endpointlar ro'yxati.
-    html_urls: HTML sahifa URL'lar (birinchisi asosiy, qolganlari fallback).
-    """
-    # 1) Rasmiy JSON API urinish
-    for api_url in api_urls:
-        try:
-            async with session.get(api_url, headers=HEADERS, timeout=TIMEOUT) as r:
-                if r.status != 200:
-                    continue
-                text = await r.text(errors="replace")
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                result = _parse_json_for_rub(data)
-                if result:
-                    log.info("Bank API (%s): buy=%s sell=%s", api_url, result[0], result[1])
-                    return result
-        except Exception as e:
-            log.debug("Bank API (%s): %s", api_url, e)
-
-    # 2) HTML sahifalar: avval inline JSON, keyin jadval
-    for html_url in html_urls:
-        try:
-            async with session.get(html_url, headers=HEADERS, timeout=TIMEOUT) as r:
-                if r.status != 200:
-                    continue
-                html = await r.text(errors="replace")
-            soup = BeautifulSoup(html, _PARSER)
-
-            # 2a) <script> ichidagi inline JSON
-            for script in soup.find_all("script"):
-                src = script.string or ""
-                if "RUB" not in src.upper():
-                    continue
-                for m in re.finditer(r'(\[[\s\S]*?\]|\{[\s\S]*?\})', src):
-                    try:
-                        result = _parse_json_for_rub(json.loads(m.group()))
-                        if result:
-                            log.info("Bank inline JSON (%s): buy=%s sell=%s", html_url, *result)
-                            return result
-                    except Exception:
-                        pass
-
-            # 2b) HTML jadval
-            result = _extract_rub_from_table(soup)
-            if result and (result[0] is not None or result[1] is not None):
-                log.info("Bank HTML table (%s): buy=%s sell=%s", html_url, *result)
-                return result
-        except Exception as e:
-            log.debug("Bank HTML (%s): %s", html_url, e)
-
-    return None
-
-
-# ---------------------------------------------------------------------------
 # KURS.UZ AGREGATOR — zaxira manba
 # ---------------------------------------------------------------------------
 
@@ -1241,24 +969,6 @@ async def _fetch_service_pairs(
             results.append({"key": key, "name": name, "type": stype, "pair": pair, "rate": None})
         return results
 
-    if method == "bank_json_api":
-        api_urls  = fetch.get("api_urls", [])
-        html_urls = [fetch["url"]] + fetch.get("fallback_urls", []) if fetch.get("url") else fetch.get("fallback_urls", [])
-        scraped   = await _fetch_bank_json_api(session, api_urls, html_urls)
-        buy_rate, sell_rate = scraped if scraped else (None, None)
-        if buy_rate is not None or sell_rate is not None:
-            log.info("✓ %s: RUB buy=%s sell=%s", name, buy_rate, sell_rate)
-        else:
-            log.warning("✗ %s: kurs topilmadi (bank_json_api)", name)
-        for pair in pairs:
-            rate: Optional[float] = None
-            if pair == "RUB_UZS":
-                rate = buy_rate
-            elif pair == "UZS_RUB":
-                rate = (1.0 / sell_rate) if sell_rate else None
-            results.append({"key": key, "name": name, "type": stype, "pair": pair, "rate": rate})
-        return results
-
     if method == "html_scrape":
         fallback_urls = fetch.get("fallback_urls", [])
         scraped = await _scrape_bank_html(session, fetch["url"], fetch.get("rate_field", "buy"), fallback_urls)
@@ -1280,24 +990,6 @@ async def _fetch_service_pairs(
                 entry["direct"] = True               # bank o'z saytidan — aggregator bosib o'tmaydi
                 entry["source"] = fetch.get("source_label", "bank sayti")
             results.append(entry)
-        return results
-
-    if method == "themoney_bank":
-        scraped = await _fetch_themoney_bank_page(session, fetch["url"])
-        buy_rate, sell_rate = scraped if scraped else (None, None)
-
-        if buy_rate is not None or sell_rate is not None:
-            log.info("✓ %s (themoney): buy=%s sell=%s", name, buy_rate, sell_rate)
-        else:
-            log.warning("✗ %s (themoney): kurs topilmadi — %s", name, fetch.get("url", ""))
-
-        for pair in pairs:
-            rate: Optional[float] = None
-            if pair == "RUB_UZS":
-                rate = buy_rate
-            elif pair == "UZS_RUB":
-                rate = (1.0 / sell_rate) if sell_rate else None
-            results.append({"key": key, "name": name, "type": stype, "pair": pair, "rate": rate})
         return results
 
     if method == "hamkorbank_api":
@@ -1352,30 +1044,6 @@ async def _fetch_service_pairs(
             })
         return results
 
-    if method == "unirateapi_rates":
-        uni_rates = await _fetch_unirateapi(session, pairs)
-        for pair in pairs:
-            results.append({
-                "key":  key,
-                "name": name,
-                "type": stype,
-                "pair": pair,
-                "rate": uni_rates.get(pair),
-            })
-        return results
-
-    if method == "coinbase_mpay":
-        cb_rates = await _fetch_coinbase_mpay(session, pairs)
-        for pair in pairs:
-            results.append({
-                "key":  key,
-                "name": name,
-                "type": stype,
-                "pair": pair,
-                "rate": cb_rates.get(pair),
-            })
-        return results
-
     return []
 
 
@@ -1395,9 +1063,8 @@ async def refresh_all() -> set[str]:
     api_sources = [
         s for s in sources
         if s.get("fetch", {}).get("method") in (
-            "html_scrape", "themoney_bank", "koronapay_api",
-            "wise_api", "unirateapi_rates", "coinbase_mpay",
-            "bank_json_api", "hamkorbank_api", "tengebank_api",
+            "html_scrape", "koronapay_api", "wise_api",
+            "hamkorbank_api", "tengebank_api",
         )
     ]
     js_sources = [s for s in sources if s.get("fetch", {}).get("method") == "js_render"]
