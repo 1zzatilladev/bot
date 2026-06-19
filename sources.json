@@ -146,7 +146,11 @@
     "name": "Orient Finans Bank",
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
-    "fetch": { "method": "aggregator" }
+    "fetch": {
+      "method": "html_scrape",
+      "url": "https://ofb.uz/en/foreign-exchange-operations",
+      "source_label": "ofb.uz"
+    }
   },
   {
     "key": "aab",
@@ -197,9 +201,9 @@
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
     "fetch": {
-      "method": "js_render",
-      "url": "https://hayotbank.uz/main/exchange-rate",
-      "source_label": "hayotbank.uz"
+      "method": "hayotbank_api",
+      "api_url": "https://api.hayotbank.uz/api/curr-exchange-rate/get-all",
+      "_comment": "Bankning o'z rasmiy API'si (currency.code=643 RUB)."
     }
   },
   {

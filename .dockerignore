@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.env
+rates.db
+.git/
+*.md
+_preview.txt
+_disc.txt
+_probe.txt

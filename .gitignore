@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bot runtime ma'lumotlari (serverda avtomatik yaratiladi)
+rates.db
+users.json
+_preview.txt
+_disc.txt
+_probe.txt

@@ -1,126 +1,136 @@
 # Valyuta Kurslari Telegram Boti
 
-Rossiya ↔ O'zbekiston pul o'tkazmalari kurslarini real vaqtda ko'rsatadigan Telegram bot.
+Rossiya ↔ O'zbekiston pul o'tkazmalari (RUB ↔ UZS) kurslarini real vaqtda
+ko'rsatadigan Telegram bot. Banklarning kurslarini o'z saytlari/API'lari va
+aggregatorlardan yig'adi, Universal bank bilan taqqoslaydi.
 
 ## Xususiyatlar
 
-- **4 yo'nalish** — RUB↔UZS va RUB↔USD tugmalari
-- **Tezlik** — kurslar keshdan chiqadi (API kutilmaydi)
-- **O'sish/pasayish** — 🟢/🔴 emoji bilan oldingi qiymat bilan taqqoslash
-- **CBU farqi** — har servisning rasmiy kursdan farqi (+/-)
-- **Avtomatik yangilanish** — har 10 daqiqada fon vazifasi
+- **RUB → UZS** va **UZS → RUB** tugmalari
+- **Har bank o'z manbaidan** (real API yoki sayt), aggregator (bank.uz, themoney.uz, kurs.uz) — zaxira
+- **Universal bank bilan farq** — har bank yonida qavs ichida (`-5.84`)
+- **O'zgarish belgisi** — ▲/▼ oxirgi yangilanishdan farq
+- **Avtomatik xabar** — kurs o'zgarganda barcha foydalanuvchiga (flood'ga chidamli)
+- **Hech qachon bo'sh qolmaydi** — manba ishlamasa, oxirgi ma'lum kurs ko'rsatiladi
 
-## Tez ishga tushirish
+## O'rnatish
 
 ```bash
-# 1. Muhit sozlash
+# 1. Virtual muhit
 python -m venv venv
-venv\Scripts\activate      # Windows
-# source venv/bin/activate  # Linux/Mac
+source venv/bin/activate       # Linux/Mac
+# venv\Scripts\activate        # Windows
 
-# 2. Paketlarni o'rnatish
+# 2. Paketlar
 pip install -r requirements.txt
 
-# 3. .env fayl yaratish
-copy .env.example .env
-# Keyin .env ni oching va kamida BOT_TOKEN ni to'ldiring
+# 3. Playwright brauzeri (JS bilan ishlovchi bank saytlari uchun ZARUR)
+playwright install chromium
+# Linux serverda tizim kutubxonalari ham kerak:
+playwright install-deps chromium      # yoki: sudo apt install libnss3 libatk1.0-0 libgbm1 ...
 
-# 4. Botni ishga tushirish
+# 4. Sozlamalar
+cp .env.example .env
+# .env ni oching va BOT_TOKEN ni to'ldiring (@BotFather dan)
+
+# 5. Ishga tushirish
 python bot.py
 ```
 
+> ⚠️ **Playwright brauzeri o'rnatilmasa**, JS bank saytlari (SQB, Universal, Agrobank)
+> aggregatordan olinadi — bot baribir ishlaydi, lekin o'z saytidan emas.
+
 ## .env sozlamalari
 
-| O'zgaruvchi | Tavsif | Majburiy |
+| O'zgaruvchi | Tavsif | Standart |
 |---|---|---|
-| `BOT_TOKEN` | BotFather dan olingan token | ✅ |
-| `CHANNEL_USERNAME` | Kanal username (masalan `@mychannel`) | ❌ |
-| `SUPPORT_URL` | Qo'llab-quvvatlash URL | ❌ |
-| `UPDATE_INTERVAL` | Yangilash oralig'i (soniya, standart 600) | ❌ |
+| `BOT_TOKEN` | @BotFather dan olingan token — **MAJBURIY** | — |
+| `CHANNEL_USERNAME` | Kanal (masalan `@mychannel`) | — |
+| `SUPPORT_URL` | Qo'llab-quvvatlash havolasi | — |
+| `AUTO_INTERVAL` | Kurslarni necha soniyada tekshirish | 600 |
+| `NOTIFY_MIN_INTERVAL` | Kamida shu oraliqda bir xabar | 3600 |
+| `REFRESH_TIMEOUT` | Bitta yangilanish uchun umumiy vaqt chegarasi | 60 |
+| `SOURCE_TIMEOUT` | Bitta manba uchun vaqt chegarasi | 10 |
+| `JS_RENDER_TIMEOUT` | Playwright (brauzer) uchun vaqt chegarasi | 40 |
+| `RATE_BAND_LO` / `RATE_BAND_HI` | Mantiqsiz kurslarni filtrlash (CBU atrofida) | 0.80 / 1.08 |
+| `MAX_STALE_SECONDS` | Oxirgi ma'lum kursni saqlash muddati | 86400 |
+
+> ⚠️ `REFRESH_TIMEOUT` ni juda kichik (masalan 1) qilmang — banklar ulgurmay
+> ro'yxatdan tushib qoladi. 60 tavsiya etiladi.
+
+## Serverga chiqarish (Linux, systemd)
+
+`/etc/systemd/system/kursbot.service`:
+
+```ini
+[Unit]
+Description=Valyuta Kurslari Telegram Bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/user/bot-file2
+ExecStart=/home/user/bot-file2/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+User=user
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now kursbot
+sudo systemctl status kursbot       # holatni ko'rish
+journalctl -u kursbot -f            # loglarni kuzatish
+```
+
+`Restart=always` — bot qulasa ham avtomatik qayta ishga tushadi.
 
 ## Loyiha tuzilmasi
 
 ```
 bot-file2/
-├── bot.py          — Telegram bot (aiogram 3.x), tugmalar, xabar formatlash
-├── fetcher.py      — CBU/CBR/HTML kurs yig'ish, in-memory kesh
-├── db.py           — SQLite: oldingi kurslarni saqlash (🟢/🔴 uchun)
-├── sources.json    — Servislar konfiguratsiyasi (yangi servis qo'shish uchun)
-├── rates.py        — Eski bank taqqoslov moduli (saqlab qolindi)
+├── bot.py          — Telegram bot (aiogram 3.x): tugmalar, xabar, bildirishnoma
+├── fetcher.py      — Kurs yig'ish: API'lar, aggregatorlar, Playwright, kesh
+├── db.py           — SQLite: oldingi kurslar (▲/▼ uchun) va tarix
+├── sources.json    — Banklar/servislar konfiguratsiyasi
+├── rates.db        — SQLite ma'lumotlar bazasi (avtomatik yaratiladi)
+├── users.json      — Obunachilar ro'yxati (avtomatik)
 ├── requirements.txt
-├── .env.example
+├── .env            — Maxfiy sozlamalar (git'ga TUSHMAYDI)
+├── .env.example    — Namuna
+├── BANK_APIS.md    — Barcha ma'lumot manbalari (qaysi bank qayerdan)
 └── README.md
 ```
 
-## Yangi servis qo'shish (sources.json)
+## Ma'lumot manbalari (qisqacha)
 
-```json
-{
-  "key": "myservice",
-  "name": "My Service",
-  "type": "card",
-  "pairs": ["RUB_UZS"],
-  "fetch": {
-    "method": "html_scrape",
-    "url": "https://myservice.com/rates",
-    "rate_field": "buy"
-  }
-}
-```
-
-**`method` turlari:**
-
-| Qiymat | Ma'no |
+| Tur | Manba |
 |---|---|
-| `cbu_api` | CBU JSON API (faqat CBU uchun) |
-| `cbr_xml` | CBR XML API (faqat CBR uchun) |
-| `html_scrape` | HTML jadvaldan RUB qatorini topadi |
-| `json_api` | JSON API (path va group parametrlari bilan) |
-| `pending` | Manba hali to'ldirilmagan — `ma'lumot yo'q` holati |
+| **Real API** | CBU, CBR, Wise, Koronapay, Hamkorbank, Tenge, Hayot |
+| **O'z sayti (scrape)** | Aloqa, Anor, Ipoteka, Trast, Turon, Poytaxt, OFB |
+| **Playwright (JS sayt)** | SQB, Universal, Agrobank |
+| **Aggregator (zaxira)** | bank.uz, themoney.uz, kurs.uz — qolgan barcha banklar |
 
-**`type` turlari:**
+To'liq ro'yxat va texnik tafsilotlar: [BANK_APIS.md](BANK_APIS.md)
 
-| Qiymat | Ikona |
+## Yangi bank qo'shish
+
+`sources.json` ga yozuv qo'shing. `fetch.method` turlari:
+
+| Method | Ma'no |
 |---|---|
-| `card` | 💳 |
-| `app` | 📱 |
-| `bank` / `official` | 🏦 |
+| `aggregator` | Ma'lumot bank.uz/themoney.uz dan (faqat toza nom) |
+| `html_scrape` | Bankning o'z sahifasidan jadval o'qish (`url`, `source_label`) |
+| `js_render` | JS bilan ishlovchi sahifa (Playwright orqali) |
+| `hamkorbank_api` / `tengebank_api` / `hayotbank_api` | Bankning o'z JSON API'si |
 
-## Pending servislarni to'ldirish
-
-`sources.json` da `"method": "pending"` deb belgilangan servislar (Yubor, Avosend, Unired va boshqalar) hali manba URL'iga ega emas. Ularni quyidagicha to'ldirish mumkin:
-
-```json
-"fetch": {
-  "method": "html_scrape",
-  "url": "https://yubor.ru/rates",
-  "rate_field": "buy"
-}
-```
-
-Agar servisda JSON API bo'lsa:
-
-```json
-"fetch": {
-  "method": "json_api",
-  "url": "https://api.service.com/rates",
-  "path": ["data", "RUB", "rate"]
-}
-```
-
-## Kurs ma'lumot manbalari
-
-| Manba | Usul | Tavsif |
-|---|---|---|
-| **CBU** | JSON API | O'zbekiston MB rasmiy kursi |
-| **CBR** | XML API | Rossiya MB rasmiy kursi (USD/RUB) |
-| **Uzbek banklar** | HTML scraping | NBU, Kapitalbank, UZUM va boshqalar |
-| **Transfer servislar** | Pending | Yubor, Avosend va boshqalar (to'ldirish kerak) |
-
-> **Muhim:** Soxta raqam chiqarilmaydi. Agar manba ishlamasa — o'sha servis `ma'lumot yo'q` holati bilan ko'rsatiladi.
+> **Hech qachon API URL'ni taxmin qilmang** — jonli tekshiring. Aks holda 404 yoki
+> noto'g'ri ma'lumot. Aggregatorlar baribir hamma bankni qoplaydi.
 
 ## Talablar
 
 - Python 3.11+
-- `pip install -r requirements.txt`
-- BotFather dan Telegram bot token
+- `pip install -r requirements.txt` + `playwright install chromium`
+- @BotFather dan Telegram bot token

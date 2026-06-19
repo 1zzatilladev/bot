@@ -17,6 +17,7 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardButton,
@@ -103,6 +104,10 @@ NOTIFY_PAIRS = ["RUB_UZS", "UZS_RUB"]
 
 _users: set[int] = set()
 _last_notify_time: Optional[datetime] = None
+
+# Tugma bosishni cheklash (flood control oldini olish): user → oxirgi bosish vaqti
+_last_button_press: dict[int, datetime] = {}
+BUTTON_COOLDOWN = 1.5  # soniya — shu vaqt ichida qayta bosilsa e'tiborsiz qoldiriladi
 
 
 def _load_users_from_file() -> None:
@@ -204,9 +209,8 @@ def _rate_num(rate: float, pair: str) -> str:
 
 def _change_tag(e: dict, pair: str) -> str:
     """
-    Oxirgi yangilanishdan beri o'zgarishni ko'rsatadi: ' 🟢 +2.00' / ' 🔴 −1.50'.
-    Yashil = foydalanuvchi uchun yaxshi tomonga, Qizil = yomon tomonga.
-    O'zgarmagan yoki yangi banklarda bo'sh qatorga qaytadi.
+    Oxirgi yangilanishdan beri o'zgarish: ko'tarilgan 🟢▲, tushgan 🔴▼.
+    Ko'rsatiladigan qiymat (kurs) bo'yicha yo'nalish. O'zgarmasa — bo'sh.
     """
     prev = e.get("prev_rate")
     rate = e.get("rate")
@@ -217,18 +221,37 @@ def _change_tag(e: dict, pair: str) -> str:
 
     if pair == "UZS_RUB":
         now_disp, prev_disp = 1.0 / rate, 1.0 / prev   # sell narxi
-        good = now_disp < prev_disp                     # arzonlashdi = yaxshi
     else:
         mult = PAIR_DISPLAY[pair]["multiplier"]
         now_disp, prev_disp = rate * mult, prev * mult
-        good = now_disp > prev_disp                     # ko'paydi = yaxshi
 
     delta = now_disp - prev_disp
     if abs(delta) < 0.01:
         return ""
-    icon = "🟢" if good else "🔴"
-    sign = "+" if delta > 0 else "−"
-    return f"  {icon} {sign}{abs(delta):.2f}"
+    tag = "▲" if delta > 0 else "▼"           # ko'tarildi / tushdi (rangsiz)
+    return f" {tag}{abs(delta):.2f}"
+
+
+def _vs_ref(e: dict, pair: str) -> str:
+    """
+    Universal bank bilan farqni QAVS ichida, har tiyingacha aniq qaytaradi:
+      '(-5.84)' / '(+10.00)'. Universal bankning o'zida '(asos)'.
+    Rangli belgi yo'q.
+    """
+    if e.get("key") == "universalbank":
+        return " (asos)"
+    ref  = fetcher.get_reference_rate(pair)
+    rate = e.get("rate")
+    if not ref or ref <= 0 or not rate or rate <= 0:
+        return ""
+    if pair == "UZS_RUB":
+        diff = (1.0 / rate) - (1.0 / ref)   # sell narxi farqi
+    else:
+        diff = rate - ref                    # so'm farqi
+    if abs(diff) < 0.005:
+        return " (0.00)"
+    sign = "+" if diff > 0 else "-"
+    return f" ({sign}{abs(diff):.2f})"
 
 
 def build_rates_message(pair: str, is_notification: bool = False) -> str:
@@ -261,17 +284,17 @@ def build_rates_message(pair: str, is_notification: bool = False) -> str:
         lines.append("⚠️ <i>Hozircha ma'lumot yo'q. Birozdan so'ng qayta urinib ko'ring.</i>")
         return "\n".join(lines)
 
-    # Ro'yxat allaqachon foydalilik bo'yicha tartiblangan (fetcher tomonidan)
+    # Bir qatorda: kurs | bank nomi (Universaldan farq)  + o'zgarish
     for e in ok_entries:
         icon     = TYPE_ICON.get(e.get("type", "bank"), "💱")
         rate_str = _rate_num(e["rate"], pair)
-        change   = _change_tag(e, pair)
-        lines.append(f"<b>{rate_str}</b> | {icon} {e['name']}{change}")
+        vs_ref   = _vs_ref(e, pair)          # (-5.84) — Universaldan farq
+        change   = _change_tag(e, pair)      # ▲/▼ oxirgi o'zgarish
+        lines.append(f"<b>{rate_str}</b> | {icon} {e['name']}{vs_ref}{change}")
 
     # Izoh (legend)
     lines.append("")
-    lines.append("🏦 — markaziy bank · 💳 — o'tkazma · 💱 — bank ilovasi")
-    lines.append("🟢/🔴 — oxirgi yangilanishdan beri o'zgarish")
+    lines.append("(  ) — Universal bankdan farq, so'm · ▲/▼ — o'zgarish")
 
     # Ma'lumot yo'q banklar — faqat UZS_RUB uchun, ixcham
     if no_entries and pair != "RUB_UZS":
@@ -283,13 +306,43 @@ def build_rates_message(pair: str, is_notification: bool = False) -> str:
     return "\n".join(lines)
 
 
+# ─── Xavfsiz yuborish (flood/blok himoyasi) ───────────────────────────────────
+
+async def _safe_send(bot: Bot, chat_id: int, text: str) -> str:
+    """
+    Xabarni xavfsiz yuboradi. Telegram xatolarini ushlaydi:
+      'ok'      — yuborildi
+      'blocked' — user botni bloklagan/o'chirgan (ro'yxatdan chiqarish kerak)
+      'flood'   — flood control (vaqtincha o'tkazib yuboriladi, bot qulamaydi)
+      'error'   — boshqa xato
+    """
+    try:
+        await bot.send_message(
+            chat_id, text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=main_keyboard(),
+        )
+        return "ok"
+    except TelegramRetryAfter as e:
+        log.warning("Flood control (chat=%s): %ss — o'tkazib yuborildi", chat_id, e.retry_after)
+        return "flood"
+    except TelegramForbiddenError:
+        return "blocked"
+    except TelegramBadRequest as e:
+        if any(k in str(e).lower() for k in ("not found", "chat not found", "deactivated")):
+            return "blocked"
+        log.warning("Xabar yuborilmadi (chat=%s): %s", chat_id, e)
+        return "error"
+    except Exception as e:
+        log.warning("Xabar yuborilmadi (chat=%s): %s", chat_id, e)
+        return "error"
+
+
 # ─── Bildirishnomalar ─────────────────────────────────────────────────────────
 
 async def send_notifications(bot: Bot, pairs: set[str], is_change: bool = False) -> None:
-    """Barcha foydalanuvchilarga kurs xabarini yuboradi.
-    is_change=True: kurs o'zgandi belgisi ko'rinadi.
-    is_change=False: oddiy yangilanish xabari yuboriladi.
-    """
+    """Barcha foydalanuvchilarga kurs xabarini yuboradi (flood'ga chidamli)."""
     if not _users:
         return
 
@@ -299,20 +352,12 @@ async def send_notifications(bot: Bot, pairs: set[str], is_change: bool = False)
             continue
         text = build_rates_message(pair, is_notification=is_change) + _support_footer()
         for user_id in list(_users):
-            try:
-                await bot.send_message(
-                    user_id, text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    reply_markup=main_keyboard(),   # tugmalar doim ko'rinib tursin
-                )
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                err = str(e).lower()
-                if any(k in err for k in ("blocked", "deactivated", "not found", "chat not found")):
-                    blocked.append(user_id)
-                else:
-                    log.warning("Xabar yuborilmadi (user=%s): %s", user_id, e)
+            status = await _safe_send(bot, user_id, text)
+            if status == "blocked":
+                blocked.append(user_id)
+            elif status == "flood":
+                break  # bu juftlik bo'yicha to'xtaymiz — Telegram'ni yana bezovta qilmaymiz
+            await asyncio.sleep(0.5)   # chatlar orasida xavfsiz oraliq (flood oldini olish)
 
     for uid in set(blocked):
         _remove_user(uid)
@@ -347,11 +392,12 @@ async def cmd_help(message: Message) -> None:
         "ℹ️ <b>Yordam</b>\n\n"
         "• Kurs ko'rish uchun pastdagi tugmani bosing\n"
         "• /refresh — kurslarni hoziroq yangilash\n"
-        "• Kurs o'zgarganda <b>avtomatik xabar</b> keladi\n"
-        "• Qavs ichidagi raqam — Universal bank kursidan farq\n"
-        "• 🟢 oshdi  🔴 tushdi  ⚪ o'zgarmadi\n"
-        "• <b>qimmatroq</b> = Universal bankdan ko'ra qimmat\n"
-        "• <b>arzonroq</b> = Universal bankdan ko'ra arzon\n\n"
+        "• Kurs o'zgarganda <b>avtomatik xabar</b> keladi\n\n"
+        "<b>Belgilar:</b>\n"
+        "• Qavs ichidagi raqam — Universal bankdan farq (so'm)\n"
+        "   (-) arzon/ko'p foydali · (+) qimmat/kam · (0.00) bir xil\n"
+        "• ▲ ko'tarildi · ▼ tushdi (oxirgi yangilanishdan)\n"
+        "• 🏦 markaziy bank · 💳 o'tkazma · 💱 bank ilovasi\n\n"
         "Muammo bo'lsa /start ni bosing.",
         parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard(),
@@ -373,21 +419,24 @@ async def cmd_refresh(message: Message) -> None:
 
 @dp.message(F.text.in_(BUTTON_TO_PAIR))
 async def handle_pair_button(message: Message) -> None:
+    user_id = message.from_user.id
+
+    # Throttle: tez-tez bosishdan himoya (flood control oldini oladi)
+    now = datetime.now()
+    last = _last_button_press.get(user_id)
+    if last and (now - last).total_seconds() < BUTTON_COOLDOWN:
+        return  # juda tez bosildi — e'tiborsiz qoldiramiz
+    _last_button_press[user_id] = now
+
     pair = BUTTON_TO_PAIR[message.text]
     if fetcher.get_cached(pair) is None:
-        wait_msg = await message.answer("⏳ Kurslar olinmoqda...", parse_mode=ParseMode.HTML)
+        await _safe_send(message.bot, user_id, "⏳ Kurslar olinmoqda...")
         try:
             await fetcher.refresh_all()
         except Exception:
             pass
-        await wait_msg.delete()
     text = build_rates_message(pair) + _support_footer()
-    await message.answer(
-        text,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-        reply_markup=main_keyboard(),   # RUB↔UZS tugmalari doim ko'rinib tursin
-    )
+    await _safe_send(message.bot, user_id, text)
 
 
 # ─── Fon vazifasi ─────────────────────────────────────────────────────────────
@@ -398,15 +447,28 @@ async def updater_loop(bot: Bot) -> None:
         "Kurs yangilovchi vazifa boshlandi (interval=%ds, notify_min=%ds)",
         UPDATE_INTERVAL, NOTIFY_MIN_INTERVAL,
     )
+    cycle = 0
+    purge_every = max(1, int(86400 / max(UPDATE_INTERVAL, 1)))  # ~ kuniga 1 marta
     while True:
         try:
             changed_pairs = await fetcher.refresh_all()
             now = datetime.now()
 
+            # Eski tarixni tozalash (DB shishib ketmasligi uchun)
+            cycle += 1
+            if cycle % purge_every == 0:
+                try:
+                    removed = db.purge_old_history(days=30)
+                    if removed:
+                        log.info("Tarix tozalandi: %d eski yozuv o'chirildi", removed)
+                except Exception as e:
+                    log.warning("Tarix tozalashda xato: %s", e)
+
             if changed_pairs:
-                # Kurs o'zgardi → darhol barcha userlarga xabar
-                log.info("O'zgargan juftlar: %s — xabar yuborilyapti", changed_pairs)
-                await send_notifications(bot, set(NOTIFY_PAIRS), is_change=True)
+                # Faqat O'ZGARGAN juftlarni yuboramiz (ikkalasini emas — kamroq xabar)
+                to_send = changed_pairs & set(NOTIFY_PAIRS)
+                log.info("O'zgargan juftlar: %s — xabar yuborilyapti", to_send)
+                await send_notifications(bot, to_send, is_change=True)
                 _last_notify_time = now
             elif _users:
                 # Kurs o'zgarmadi → NOTIFY_MIN_INTERVAL o'tgan bo'lsa rejalashtirilgan xabar
@@ -424,9 +486,14 @@ async def updater_loop(bot: Bot) -> None:
 # ─── Ishga tushirish ──────────────────────────────────────────────────────────
 
 async def main() -> None:
+    global _last_notify_time
+
     db.init_db()
     _load_users_from_file()
     log.info("Foydalanuvchilar yuklandi: %d ta", len(_users))
+
+    # Ishga tushganda darhol rejalashtirilgan xabar yubormaslik uchun
+    _last_notify_time = datetime.now()
 
     bot = Bot(token=BOT_TOKEN)  # type: ignore[arg-type]
 
@@ -437,10 +504,19 @@ async def main() -> None:
     except Exception as e:
         log.warning("Boshlang'ich kurs olishda xato: %s", e)
 
-    asyncio.create_task(updater_loop(bot))
+    updater = asyncio.create_task(updater_loop(bot))
     log.info("Bot polling boshlandi")
-    await dp.start_polling(bot, skip_updates=True)
+    try:
+        await dp.start_polling(bot, skip_updates=True)
+    finally:
+        # Toza to'xtatish (server qayta ishga tushganda resurslar bo'shaydi)
+        updater.cancel()
+        await bot.session.close()
+        log.info("Bot to'xtatildi")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Foydalanuvchi to'xtatdi (Ctrl+C)")

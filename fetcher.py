@@ -434,6 +434,10 @@ _cbu_official: dict[str, float] = {}
 _universal_bank_rates: dict[str, float] = {}
 CACHE_TTL = 600  # 10 daqiqa
 
+# Oxirgi MA'LUM qiymat: manba vaqtincha ishlamasa, bank yo'qolib qolmasligi uchun.
+# {(key, pair): (rate, datetime)} — faqat haqiqiy (None bo'lmagan) qiymatlar saqlanadi.
+_last_good: dict[tuple[str, str], tuple[float, datetime]] = {}
+
 
 def get_cached(pair: str) -> Optional[list[dict]]:
     if _cache_time and (datetime.now() - _cache_time).total_seconds() < CACHE_TTL:
@@ -843,6 +847,51 @@ async def _fetch_tengebank_api(
 
 
 # ---------------------------------------------------------------------------
+# HAYOTBANK — bankning o'z rasmiy API'si (tasdiqlangan)
+# ---------------------------------------------------------------------------
+
+async def _fetch_hayotbank_api(
+    session: aiohttp.ClientSession,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Hayot Bank rasmiy API'sidan RUB kursini oladi.
+    Endpoint: api.hayotbank.uz/api/curr-exchange-rate/get-all
+    data[] ichida currency.code == 643 (RUB) → buy/sell (to'g'ridan-to'g'ri so'm).
+    """
+    url = ("https://api.hayotbank.uz/api/curr-exchange-rate/get-all"
+           "?size=2000&search=currExchangeRate.active=true")
+    try:
+        async with session.get(
+            url, headers={**HEADERS, "Accept": "application/json"}, timeout=TIMEOUT,
+        ) as r:
+            if r.status != 200:
+                log.warning("Hayotbank API: HTTP %d", r.status)
+                return (None, None)
+            data = await r.json(content_type=None)
+
+        rows = data.get("data") if isinstance(data, dict) else data
+        for it in (rows or []):
+            cur = it.get("currency") or {}
+            if str(cur.get("code")) != "643":      # 643 = RUB
+                continue
+            try:
+                buy  = float(it.get("buy"))
+                sell = float(it.get("sell"))
+            except (TypeError, ValueError):
+                continue
+            if not (10 < buy < 5000):
+                buy = None
+            if not (10 < sell < 5000):
+                sell = None
+            log.info("Hayotbank API: buy=%s sell=%s", buy, sell)
+            return (buy, sell)
+        log.warning("Hayotbank API: RUB topilmadi")
+    except Exception as e:
+        log.warning("Hayotbank API: %s", e)
+    return (None, None)
+
+
+# ---------------------------------------------------------------------------
 # WISE API — bepul mid-market kurs (barcha juftlar)
 # ---------------------------------------------------------------------------
 
@@ -1007,6 +1056,21 @@ async def _fetch_service_pairs(
             results.append(entry)
         return results
 
+    if method == "hayotbank_api":
+        buy_rate, sell_rate = await _fetch_hayotbank_api(session)
+        for pair in pairs:
+            rate: Optional[float] = None
+            if pair == "RUB_UZS":
+                rate = buy_rate
+            elif pair == "UZS_RUB":
+                rate = (1.0 / sell_rate) if sell_rate else None
+            entry = {"key": key, "name": name, "type": stype, "pair": pair, "rate": rate}
+            if rate is not None:
+                entry["direct"] = True
+                entry["source"] = "hayotbank.uz"
+            results.append(entry)
+        return results
+
     if method == "tengebank_api":
         buy_rate, sell_rate = await _fetch_tengebank_api(session)
         for pair in pairs:
@@ -1064,7 +1128,7 @@ async def refresh_all() -> set[str]:
         s for s in sources
         if s.get("fetch", {}).get("method") in (
             "html_scrape", "koronapay_api", "wise_api",
-            "hamkorbank_api", "tengebank_api",
+            "hamkorbank_api", "tengebank_api", "hayotbank_api",
         )
     ]
     js_sources = [s for s in sources if s.get("fetch", {}).get("method") == "js_render"]
@@ -1085,7 +1149,7 @@ async def refresh_all() -> set[str]:
         # Har bir individual manba uchun vaqt chegarasi — bitta sekin bank
         # butun yangilanishni cho'zib yubormasligi uchun. Aggregatorlar
         # (bank.uz/themoney.uz) baribir hamma bankni qoplaydi.
-        per_source_timeout = float(os.environ.get("SOURCE_TIMEOUT", "8"))
+        per_source_timeout = float(os.environ.get("SOURCE_TIMEOUT", "10"))
 
         async def _bounded_fetch(src: dict) -> list[dict]:
             try:
@@ -1109,7 +1173,7 @@ async def refresh_all() -> set[str]:
 
         # Umumiy timeout — biror manba osilib qolsa ham bot muzlab qolmaydi.
         # Tugamagan task'lar None deb hisoblanadi, qolgan ma'lumotlar ishlatiladi.
-        overall_timeout = float(os.environ.get("REFRESH_TIMEOUT", "25"))
+        overall_timeout = float(os.environ.get("REFRESH_TIMEOUT", "60"))
         try:
             all_results = await asyncio.wait_for(gather_future, timeout=overall_timeout)
         except asyncio.TimeoutError:
@@ -1266,6 +1330,22 @@ async def refresh_all() -> set[str]:
                     pair, e["name"], r, cbu_rate, lo, hi,
                 )
                 e["rate"] = None
+
+    # 4c) OXIRGI MA'LUM QIYMAT — manba bu safar ishlamasa, bank yo'qolib qolmaydi.
+    # Haqiqiy qiymatlarni saqlaymiz; ma'lumotsiz banklarga so'nggi ma'lum qiymatni
+    # qaytaramiz (MAX_STALE soniyadan eski bo'lmasa). Shunda banklar "kamayib ketmaydi".
+    now_cf = datetime.now()
+    max_stale = float(os.environ.get("MAX_STALE_SECONDS", "86400"))  # 24 soat
+    for pair, entries in new_cache.items():
+        for e in entries:
+            gkey = (e["key"], pair)
+            if e.get("rate") is not None:
+                _last_good[gkey] = (e["rate"], now_cf)          # yangi qiymatni eslab qolamiz
+            else:
+                prev = _last_good.get(gkey)
+                if prev and (now_cf - prev[1]).total_seconds() < max_stale:
+                    e["rate"]  = prev[0]                        # oxirgi ma'lum qiymat
+                    e["stale"] = True                           # eski (manba vaqtincha ishlamadi)
 
     # 5) O'sish/pasayish hisoblash + CBU farq
     db_entries:      list[tuple[str, str, float]] = []
