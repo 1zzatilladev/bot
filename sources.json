@@ -19,15 +19,6 @@
     }
   },
   {
-    "key": "unirateapi",
-    "name": "UniRateAPI",
-    "type": "market",
-    "pairs": ["RUB_UZS", "UZS_RUB"],
-    "fetch": {
-      "method": "unirateapi_rates"
-    }
-  },
-  {
     "key": "koronapay",
     "name": "Koronapay",
     "type": "card",
@@ -37,25 +28,24 @@
       "receiving_method": "cash"
     }
   },
+
   {
-    "key": "aloqabank",
-    "name": "Aloqabank",
+    "key": "universalbank",
+    "name": "Universal bank",
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
     "fetch": {
-      "method": "themoney_bank",
-      "url": "https://themoney.uz/banks/aloqa-bank/rub/"
+      "method": "js_render",
+      "url": "https://universalbank.uz/currency",
+      "source_label": "universalbank.uz"
     }
   },
   {
-    "key": "ipotekabank",
-    "name": "Ipoteka-bank",
+    "key": "nbu",
+    "name": "Milliy bank (NBU)",
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
-    "fetch": {
-      "method": "themoney_bank",
-      "url": "https://themoney.uz/banks/ipoteka-bank/rub/"
-    }
+    "fetch": { "method": "aggregator" }
   },
   {
     "key": "agrobank",
@@ -63,9 +53,75 @@
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
     "fetch": {
-      "method": "themoney_bank",
-      "url": "https://themoney.uz/uz/banks/agro-bank/rub/"
+      "method": "js_render",
+      "url": "https://agrobank.uz/en/person/exchange_rates",
+      "source_label": "agrobank.uz"
     }
+  },
+  {
+    "key": "sqb",
+    "name": "Sanoatqurilish banki (SQB)",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "js_render",
+      "url": "https://sqb.uz/en/",
+      "source_label": "sqb.uz"
+    }
+  },
+  {
+    "key": "ipotekabank",
+    "name": "Ipoteka Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "html_scrape",
+      "url": "https://www.ipotekabank.uz/en/private/services/currency/",
+      "source_label": "ipotekabank.uz"
+    }
+  },
+  {
+    "key": "asakabank",
+    "name": "Asaka Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "aloqabank",
+    "name": "Aloqabank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "html_scrape",
+      "url": "https://aloqabank.uz/en/services/exchange-rates/",
+      "source_label": "aloqabank.uz"
+    }
+  },
+  {
+    "key": "turonbank",
+    "name": "Turonbank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "html_scrape",
+      "url": "https://turonbank.uz/en/services/exchange-rates/",
+      "source_label": "turonbank.uz"
+    }
+  },
+  {
+    "key": "brb",
+    "name": "BRB Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "kapitalbank",
+    "name": "Kapitalbank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
   },
   {
     "key": "hamkorbank",
@@ -73,8 +129,113 @@
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
     "fetch": {
-      "method": "themoney_bank",
-      "url": "https://themoney.uz/banks/hamkorbank/rub/"
+      "method": "hamkorbank_api",
+      "api_url": "https://api-dbo.hamkorbank.uz/webflow/v1/exchanges",
+      "_comment": "Bankning o'z rasmiy API'si (asosiy). Ishlamasa aggregator zaxira."
     }
+  },
+  {
+    "key": "ipakyuli",
+    "name": "Ipak Yo'li Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "ofb",
+    "name": "Orient Finans Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "aab",
+    "name": "Asia Alliance Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "trustbank",
+    "name": "Trastbank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "html_scrape",
+      "url": "https://trustbank.uz/en/services/exchange-rates/",
+      "source_label": "trustbank.uz"
+    }
+  },
+  {
+    "key": "infinbank",
+    "name": "Infinbank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "anorbank",
+    "name": "Anor Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "html_scrape",
+      "url": "https://anorbank.uz/en/about/exchange-rates/",
+      "source_label": "anorbank.uz"
+    }
+  },
+  {
+    "key": "garantbank",
+    "name": "Garant Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "hayotbank",
+    "name": "Hayot Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "js_render",
+      "url": "https://hayotbank.uz/main/exchange-rate",
+      "source_label": "hayotbank.uz"
+    }
+  },
+  {
+    "key": "poytaxtbank",
+    "name": "Poytaxt Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "html_scrape",
+      "url": "https://poytaxtbank.uz/ru/services/exchange-rates/",
+      "source_label": "poytaxtbank.uz"
+    }
+  },
+  {
+    "key": "octobank",
+    "name": "Octobank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "tengebank",
+    "name": "Tenge Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "tengebank_api",
+      "api_url": "https://tengebank.uz/api/exchangerates/tables",
+      "_comment": "Bankning o'z rasmiy API'si."
+    }
+  },
+  {
+    "key": "madadbank",
+    "name": "Madad Invest Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
   }
 ]

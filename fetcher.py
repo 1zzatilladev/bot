@@ -60,7 +60,9 @@ _BANK_KEY_MAP: list[tuple[str, str]] = [
     ("octo",                      "octobank"),
     ("milliy",                    "nbu"),
     ("national bank",             "nbu"),
-    (" nbu",                      "nbu"),
+    ("nbu",                       "nbu"),
+    ("o'zbekiston milliy",        "nbu"),
+    ("ozbekiston milliy",         "nbu"),
     ("ipak",                      "ipakyuli"),
     ("agrobank",                  "agrobank"),
     ("agro",                      "agrobank"),
@@ -143,6 +145,9 @@ def _parse_rate_text(text: str) -> Optional[float]:
 
 _bankuz_hash: Optional[str] = None
 _bankuz_cached: dict[str, dict] = {}
+
+_kursuz_hash: Optional[str] = None
+_kursuz_cached: dict[str, dict] = {}
 
 
 def _parse_bankuz_col(container) -> dict[str, float]:
@@ -393,6 +398,8 @@ def _apply_agg_rates(
                 }
                 new_cache["RUB_UZS"].append(entry)
                 idx["RUB_UZS"][key] = entry
+            elif existing.get("direct"):
+                pass  # bank o'z API'sidan keldi — aggregator bosib o'tmaydi
             elif override_existing or existing.get("source") != "bank.uz":
                 existing.update(rate=rub_uzs, name=display_name, source=source_name)
 
@@ -411,6 +418,8 @@ def _apply_agg_rates(
                 }
                 new_cache["UZS_RUB"].append(entry)
                 idx["UZS_RUB"][key] = entry
+            elif existing.get("direct"):
+                pass  # bank o'z API'sidan keldi — aggregator bosib o'tmaydi
             elif override_existing or existing.get("source") != "bank.uz":
                 existing.update(rate=uzs_rub, name=display_name, source=source_name)
 
@@ -538,8 +547,12 @@ async def _fetch_cbr(session: aiohttp.ClientSession, retries: int = 3) -> dict[s
 def _extract_number(text: str) -> Optional[float]:
     if not text:
         return None
-    clean = re.sub(r"[^\d.,]", "", text.strip())
-    clean = clean.replace(" ", "").replace(",", ".")
+    # Faqat birinchi raqam tokenini olamiz: "100,00 - 0,00" → 100.0
+    # (ko'p bank jadvallari "kurs - o'zgarish" ko'rinishida beradi)
+    m = re.search(r"\d[\d\s]*(?:[.,]\d+)?", text.replace("\xa0", " "))
+    if not m:
+        return None
+    clean = re.sub(r"\s+", "", m.group()).replace(",", ".")
     try:
         val = float(clean)
         return val if 10 < val < 5000 else None
@@ -565,22 +578,24 @@ async def _scrape_bank_html(
     session: aiohttp.ClientSession,
     url: str,
     rate_field: str = "buy",
+    fallback_urls: Optional[list[str]] = None,
 ) -> Optional[tuple[Optional[float], Optional[float]]]:
-    try:
-        async with session.get(url, headers=HEADERS, timeout=TIMEOUT) as r:
-            if r.status != 200:
-                log.debug("HTML %s → HTTP %d", url, r.status)
-                return None
-            html = await r.text(errors="replace")
+    for try_url in [url] + (fallback_urls or []):
+        try:
+            async with session.get(try_url, headers=HEADERS, timeout=TIMEOUT) as r:
+                if r.status != 200:
+                    log.debug("HTML %s → HTTP %d", try_url, r.status)
+                    continue
+                html = await r.text(errors="replace")
 
-        soup = BeautifulSoup(html, _PARSER)
-        result = _extract_rub_from_table(soup)
-        if result and result[0] is not None:
-            return result
+            soup = BeautifulSoup(html, _PARSER)
+            result = _extract_rub_from_table(soup)
+            if result and result[0] is not None:
+                return result
 
-        log.debug("HTML scrape (%s): RUB kursi topilmadi", url)
-    except Exception as e:
-        log.debug("HTML scrape (%s): %s", url, e)
+            log.debug("HTML scrape (%s): RUB kursi topilmadi", try_url)
+        except Exception as e:
+            log.debug("HTML scrape (%s): %s", try_url, e)
     return None
 
 
@@ -698,6 +713,177 @@ async def _fetch_koronapay_api(
     except Exception as e:
         log.warning("KoronaPay API: %s", e)
         return None
+
+
+# ---------------------------------------------------------------------------
+# JS-RENDER — Playwright orqali JS bilan ishlovchi bank saytlaridan kurs olish
+# ---------------------------------------------------------------------------
+
+def _rub_numbers_from_html(html: str) -> list[float]:
+    """Renderlangan HTML dagi RUB qatoridan barcha kurs raqamlarini qaytaradi.
+    Faqat 50–300 oralig'i (valyuta kodlari 643/840/860 va mayda sonlar tashlanadi)."""
+    soup = BeautifulSoup(html, _PARSER)
+    for tr in soup.find_all("tr"):
+        t = tr.get_text(" ", strip=True)
+        if not re.search(r"\bRUB\b|\b643\b|рубл", t, re.I):
+            continue
+        nums: list[float] = []
+        for m in re.findall(r"\d[\d\s]*(?:[.,]\d+)?", t.replace("\xa0", " ")):
+            try:
+                v = float(re.sub(r"\s+", "", m).replace(",", "."))
+            except ValueError:
+                continue
+            if 50 < v < 300:
+                nums.append(v)
+        if nums:
+            return nums
+    return []
+
+
+async def _fetch_js_render_batch(js_sources: list[dict]) -> dict[str, dict]:
+    """
+    Playwright (bitta brauzer) orqali JS bilan ishlovchi bank sahifalarini
+    renderlaydi va RUB qatoridagi xom raqamlarni qaytaradi.
+    Qaytaradi: {key: {"name", "type", "numbers": [..]}}.
+    CB kursini ajratish refresh_all da (cbu ma'lum) bajariladi.
+    Brauzer yo'q yoki xato bo'lsa — bo'sh dict (aggregator zaxira bo'ladi).
+    """
+    if not js_sources:
+        return {}
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log.warning("Playwright o'rnatilmagan — JS banklar aggregatordan olinadi")
+        return {}
+
+    results: dict[str, dict] = {}
+    nav_timeout = int(os.environ.get("JS_NAV_TIMEOUT", "30000"))
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            ctx = await browser.new_context(user_agent=HEADERS["User-Agent"])
+
+            async def one(src: dict) -> None:
+                key = src["key"]
+                url = src.get("fetch", {}).get("url", "")
+                if not url:
+                    return
+                page = await ctx.new_page()
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=nav_timeout)
+                    await page.wait_for_timeout(2000)
+                    htmls = [await page.content()]
+                    for fr in page.frames:      # iframe (fondbozori va h.k.)
+                        try:
+                            htmls.append(await fr.content())
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log.warning("js_render %s: %s", key, type(e).__name__)
+                    return
+                finally:
+                    await page.close()
+                for h in htmls:
+                    nums = _rub_numbers_from_html(h)
+                    if nums:
+                        results[key] = {
+                            "name": src["name"],
+                            "type": src.get("type", "bank"),
+                            "numbers": nums,
+                        }
+                        log.info("js_render %s: %s", key, nums)
+                        return
+                log.warning("js_render %s: RUB topilmadi", key)
+
+            await asyncio.gather(*[one(s) for s in js_sources], return_exceptions=True)
+            await browser.close()
+    except Exception as e:
+        log.warning("js_render batch xato: %s", e)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# HAMKORBANK — bankning o'z rasmiy API'si (tasdiqlangan)
+# ---------------------------------------------------------------------------
+
+async def _fetch_hamkorbank_api(
+    session: aiohttp.ClientSession,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Hamkorbank rasmiy DBO API'sidan RUB kursini oladi.
+    Endpoint: api-dbo.hamkorbank.uz/webflow/v1/exchanges
+    Qiymatlar tiyinda (×100): buying_rate=14700 → 147.00, selling_rate=16700 → 167.00.
+    Qaytaradi: (buy, sell) — RUB_UZS=buy, UZS_RUB=1/sell.
+    """
+    url = "https://api-dbo.hamkorbank.uz/webflow/v1/exchanges"
+    try:
+        async with session.get(
+            url, headers={**HEADERS, "Accept": "application/json"}, timeout=TIMEOUT,
+        ) as r:
+            if r.status != 200:
+                log.warning("Hamkorbank API: HTTP %d", r.status)
+                return (None, None)
+            data = await r.json(content_type=None)
+
+        rows = data.get("data") if isinstance(data, dict) else data
+        for it in (rows or []):
+            if str(it.get("currency_char", "")).upper() != "RUB":
+                continue
+            buy_raw  = it.get("buying_rate")
+            sell_raw = it.get("selling_rate")
+            buy  = float(buy_raw) / 100.0  if buy_raw  else None
+            sell = float(sell_raw) / 100.0 if sell_raw else None
+            if buy is not None and not (10 < buy < 5000):
+                buy = None
+            if sell is not None and not (10 < sell < 5000):
+                sell = None
+            log.info("Hamkorbank API: buy=%s sell=%s", buy, sell)
+            return (buy, sell)
+        log.warning("Hamkorbank API: RUB topilmadi")
+    except Exception as e:
+        log.warning("Hamkorbank API: %s", e)
+    return (None, None)
+
+
+# ---------------------------------------------------------------------------
+# TENGEBANK — bankning o'z rasmiy API'si (tasdiqlangan)
+# ---------------------------------------------------------------------------
+
+async def _fetch_tengebank_api(
+    session: aiohttp.ClientSession,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Tenge Bank rasmiy API'sidan RUB kursini oladi.
+    Endpoint: tengebank.uz/api/exchangerates/tables
+    Javob: personal[0].currency.RUB.{buy, sell} (to'g'ridan-to'g'ri so'm).
+    """
+    url = "https://tengebank.uz/api/exchangerates/tables"
+    try:
+        async with session.get(
+            url, headers={**HEADERS, "Accept": "application/json"}, timeout=TIMEOUT,
+        ) as r:
+            if r.status != 200:
+                log.warning("Tengebank API: HTTP %d", r.status)
+                return (None, None)
+            data = await r.json(content_type=None)
+
+        personal = data.get("personal") or []
+        if personal:
+            rub = (personal[0].get("currency") or {}).get("RUB") or {}
+            buy_raw, sell_raw = rub.get("buy"), rub.get("sell")
+            buy  = float(buy_raw)  if buy_raw  else None
+            sell = float(sell_raw) if sell_raw else None
+            if buy is not None and not (10 < buy < 5000):
+                buy = None
+            if sell is not None and not (10 < sell < 5000):
+                sell = None
+            log.info("Tengebank API: buy=%s sell=%s", buy, sell)
+            return (buy, sell)
+        log.warning("Tengebank API: RUB topilmadi")
+    except Exception as e:
+        log.warning("Tengebank API: %s", e)
+    return (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +1047,179 @@ async def _fetch_coinbase_mpay(
 
 
 # ---------------------------------------------------------------------------
+# BANK RASMIY JSON API → HTML FALLBACK
+# ---------------------------------------------------------------------------
+
+def _parse_rate_val(v: object) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        val = float(str(v).replace(",", ".").replace(" ", "").replace("\xa0", ""))
+        return val if 10 < val < 5000 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_json_for_rub(data: object) -> Optional[tuple[Optional[float], Optional[float]]]:
+    """Har qanday JSON strukturasidan RUB buy/sell topadi (rekursiv)."""
+    if isinstance(data, list):
+        for item in data:
+            r = _parse_json_for_rub(item)
+            if r:
+                return r
+        return None
+    if not isinstance(data, dict):
+        return None
+    ccy = str(
+        data.get("ccy") or data.get("currency") or data.get("code") or
+        data.get("charCode") or data.get("name") or data.get("title") or ""
+    ).upper()
+    if "RUB" in ccy:
+        buy  = _parse_rate_val(
+            data.get("buy") or data.get("purchase") or
+            data.get("buyRate") or data.get("buy_rate") or data.get("in")
+        )
+        sell = _parse_rate_val(
+            data.get("sell") or data.get("sale") or
+            data.get("sellRate") or data.get("sell_rate") or data.get("out")
+        )
+        if buy or sell:
+            return buy, sell
+    for v in data.values():
+        if isinstance(v, (dict, list)):
+            r = _parse_json_for_rub(v)
+            if r:
+                return r
+    return None
+
+
+async def _fetch_bank_json_api(
+    session: aiohttp.ClientSession,
+    api_urls: list[str],
+    html_urls: list[str],
+) -> Optional[tuple[Optional[float], Optional[float]]]:
+    """
+    Bank rasmiy JSON API → inline JSON → HTML jadval ketma-ket urinadi.
+    api_urls: rasmiy API endpointlar ro'yxati.
+    html_urls: HTML sahifa URL'lar (birinchisi asosiy, qolganlari fallback).
+    """
+    # 1) Rasmiy JSON API urinish
+    for api_url in api_urls:
+        try:
+            async with session.get(api_url, headers=HEADERS, timeout=TIMEOUT) as r:
+                if r.status != 200:
+                    continue
+                text = await r.text(errors="replace")
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                result = _parse_json_for_rub(data)
+                if result:
+                    log.info("Bank API (%s): buy=%s sell=%s", api_url, result[0], result[1])
+                    return result
+        except Exception as e:
+            log.debug("Bank API (%s): %s", api_url, e)
+
+    # 2) HTML sahifalar: avval inline JSON, keyin jadval
+    for html_url in html_urls:
+        try:
+            async with session.get(html_url, headers=HEADERS, timeout=TIMEOUT) as r:
+                if r.status != 200:
+                    continue
+                html = await r.text(errors="replace")
+            soup = BeautifulSoup(html, _PARSER)
+
+            # 2a) <script> ichidagi inline JSON
+            for script in soup.find_all("script"):
+                src = script.string or ""
+                if "RUB" not in src.upper():
+                    continue
+                for m in re.finditer(r'(\[[\s\S]*?\]|\{[\s\S]*?\})', src):
+                    try:
+                        result = _parse_json_for_rub(json.loads(m.group()))
+                        if result:
+                            log.info("Bank inline JSON (%s): buy=%s sell=%s", html_url, *result)
+                            return result
+                    except Exception:
+                        pass
+
+            # 2b) HTML jadval
+            result = _extract_rub_from_table(soup)
+            if result and (result[0] is not None or result[1] is not None):
+                log.info("Bank HTML table (%s): buy=%s sell=%s", html_url, *result)
+                return result
+        except Exception as e:
+            log.debug("Bank HTML (%s): %s", html_url, e)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# KURS.UZ AGREGATOR — zaxira manba
+# ---------------------------------------------------------------------------
+
+async def _fetch_kursuz_rub(
+    session: aiohttp.ClientSession,
+    retries: int = 1,
+) -> dict[str, dict[str, float | str]]:
+    """
+    kurs.uz agregatoridan barcha banklarning RUB kurslarini oladi.
+    bank.uz va themoney.uz dan keyin uchinchi zaxira manba sifatida ishlatiladi.
+    Faqat zaxira bo'lgani uchun qisqa timeout — ishga tushishni bloklamasligi kerak.
+    """
+    global _kursuz_hash, _kursuz_cached
+
+    # Zaxira manba: qisqa timeout (asosiy fetch'larni bloklamaslik uchun)
+    kursuz_timeout = aiohttp.ClientTimeout(total=4)
+
+    for attempt in range(retries):
+        try:
+            async with session.get(
+                "https://kurs.uz/", headers=HEADERS, timeout=kursuz_timeout
+            ) as r:
+                if r.status != 200:
+                    break
+                html = await r.text(errors="replace")
+
+            content_hash = hashlib.md5(html.encode("utf-8", errors="replace")).hexdigest()
+            if content_hash == _kursuz_hash and _kursuz_cached:
+                log.debug("kurs.uz: kesh ishlatildi")
+                return _kursuz_cached
+
+            soup = BeautifulSoup(html, _PARSER)
+            out: dict[str, dict] = {}
+
+            for row in soup.find_all("tr"):
+                text = row.get_text(" ", strip=True)
+                if not re.search(r"\bRUB\b|рубл", text, re.IGNORECASE):
+                    continue
+                cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+                if len(cells) < 3:
+                    continue
+                bank_name = cells[0]
+                key = _bank_key(bank_name, "kursuz")
+                nums = [n for c in cells[1:] if (n := _parse_rate_text(c)) is not None]
+                if len(nums) >= 2:
+                    out[key] = {"name": bank_name, "buy": nums[0], "sell": nums[1]}
+                elif nums:
+                    out[key] = {"name": bank_name, "buy": nums[0]}
+
+            if out:
+                _kursuz_hash = content_hash
+                _kursuz_cached = out
+                log.info("kurs.uz: %d ta bank RUB kursi olindi", len(out))
+                return out
+
+        except Exception as e:
+            if attempt < retries - 1:
+                log.warning("kurs.uz urinish %d/%d: %s", attempt + 1, retries, e)
+                await asyncio.sleep(1)
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # BITTA SERVIS UCHUN KURS OLISH
 # ---------------------------------------------------------------------------
 
@@ -882,15 +1241,15 @@ async def _fetch_service_pairs(
             results.append({"key": key, "name": name, "type": stype, "pair": pair, "rate": None})
         return results
 
-    if method == "html_scrape":
-        scraped = await _scrape_bank_html(session, fetch["url"], fetch.get("rate_field", "buy"))
+    if method == "bank_json_api":
+        api_urls  = fetch.get("api_urls", [])
+        html_urls = [fetch["url"]] + fetch.get("fallback_urls", []) if fetch.get("url") else fetch.get("fallback_urls", [])
+        scraped   = await _fetch_bank_json_api(session, api_urls, html_urls)
         buy_rate, sell_rate = scraped if scraped else (None, None)
-
-        if buy_rate is not None:
-            log.info("✓ %s: RUB=%s (sotib olish)", name, buy_rate)
+        if buy_rate is not None or sell_rate is not None:
+            log.info("✓ %s: RUB buy=%s sell=%s", name, buy_rate, sell_rate)
         else:
-            log.warning("✗ %s: RUB kurs topilmadi", name)
-
+            log.warning("✗ %s: kurs topilmadi (bank_json_api)", name)
         for pair in pairs:
             rate: Optional[float] = None
             if pair == "RUB_UZS":
@@ -898,6 +1257,29 @@ async def _fetch_service_pairs(
             elif pair == "UZS_RUB":
                 rate = (1.0 / sell_rate) if sell_rate else None
             results.append({"key": key, "name": name, "type": stype, "pair": pair, "rate": rate})
+        return results
+
+    if method == "html_scrape":
+        fallback_urls = fetch.get("fallback_urls", [])
+        scraped = await _scrape_bank_html(session, fetch["url"], fetch.get("rate_field", "buy"), fallback_urls)
+        buy_rate, sell_rate = scraped if scraped else (None, None)
+
+        if buy_rate is not None or sell_rate is not None:
+            log.info("✓ %s: RUB buy=%s sell=%s (o'z sayti)", name, buy_rate, sell_rate)
+        else:
+            log.warning("✗ %s: RUB kurs topilmadi (o'z sayti)", name)
+
+        for pair in pairs:
+            rate: Optional[float] = None
+            if pair == "RUB_UZS":
+                rate = buy_rate
+            elif pair == "UZS_RUB":
+                rate = (1.0 / sell_rate) if sell_rate else None
+            entry = {"key": key, "name": name, "type": stype, "pair": pair, "rate": rate}
+            if rate is not None:
+                entry["direct"] = True               # bank o'z saytidan — aggregator bosib o'tmaydi
+                entry["source"] = fetch.get("source_label", "bank sayti")
+            results.append(entry)
         return results
 
     if method == "themoney_bank":
@@ -916,6 +1298,36 @@ async def _fetch_service_pairs(
             elif pair == "UZS_RUB":
                 rate = (1.0 / sell_rate) if sell_rate else None
             results.append({"key": key, "name": name, "type": stype, "pair": pair, "rate": rate})
+        return results
+
+    if method == "hamkorbank_api":
+        buy_rate, sell_rate = await _fetch_hamkorbank_api(session)
+        for pair in pairs:
+            rate: Optional[float] = None
+            if pair == "RUB_UZS":
+                rate = buy_rate
+            elif pair == "UZS_RUB":
+                rate = (1.0 / sell_rate) if sell_rate else None
+            entry = {"key": key, "name": name, "type": stype, "pair": pair, "rate": rate}
+            if rate is not None:
+                entry["direct"] = True          # bank o'z API'si — aggregator bosib o'tmaydi
+                entry["source"] = "hamkorbank.uz"
+            results.append(entry)
+        return results
+
+    if method == "tengebank_api":
+        buy_rate, sell_rate = await _fetch_tengebank_api(session)
+        for pair in pairs:
+            rate: Optional[float] = None
+            if pair == "RUB_UZS":
+                rate = buy_rate
+            elif pair == "UZS_RUB":
+                rate = (1.0 / sell_rate) if sell_rate else None
+            entry = {"key": key, "name": name, "type": stype, "pair": pair, "rate": rate}
+            if rate is not None:
+                entry["direct"] = True
+                entry["source"] = "tengebank.uz"
+            results.append(entry)
         return results
 
     if method == "koronapay_api":
@@ -985,8 +1397,10 @@ async def refresh_all() -> set[str]:
         if s.get("fetch", {}).get("method") in (
             "html_scrape", "themoney_bank", "koronapay_api",
             "wise_api", "unirateapi_rates", "coinbase_mpay",
+            "bank_json_api", "hamkorbank_api", "tengebank_api",
         )
     ]
+    js_sources = [s for s in sources if s.get("fetch", {}).get("method") == "js_render"]
 
     async with aiohttp.ClientSession() as session:
         # Barcha fetch'larni bir vaqtda boshlaymiz (parallel)
@@ -994,22 +1408,75 @@ async def refresh_all() -> set[str]:
         cbr_task      = asyncio.create_task(_fetch_cbr(session))
         bankuz_task   = asyncio.create_task(_fetch_bankuz_rub(session))
         themoney_task = asyncio.create_task(_fetch_themoney_rub(session))
+        kursuz_task   = asyncio.create_task(_fetch_kursuz_rub(session))
+        # JS-render banklar (Playwright, brauzer) — alohida, o'z timeout'i bilan
+        js_timeout = float(os.environ.get("JS_RENDER_TIMEOUT", "40"))
+        js_task = asyncio.create_task(
+            asyncio.wait_for(_fetch_js_render_batch(js_sources), timeout=js_timeout)
+        ) if js_sources else None
+
+        # Har bir individual manba uchun vaqt chegarasi — bitta sekin bank
+        # butun yangilanishni cho'zib yubormasligi uchun. Aggregatorlar
+        # (bank.uz/themoney.uz) baribir hamma bankni qoplaydi.
+        per_source_timeout = float(os.environ.get("SOURCE_TIMEOUT", "8"))
+
+        async def _bounded_fetch(src: dict) -> list[dict]:
+            try:
+                return await asyncio.wait_for(
+                    _fetch_service_pairs(session, src, {}),
+                    timeout=per_source_timeout,
+                )
+            except asyncio.TimeoutError:
+                log.warning("✗ %s: vaqt chegarasi (%.0fs)", src.get("name", "?"), per_source_timeout)
+                return []
+
         html_tasks    = [
-            asyncio.create_task(_fetch_service_pairs(session, src, {}))
+            asyncio.create_task(_bounded_fetch(src))
             for src in api_sources
         ]
 
-        # Hammasini birga kutamiz
-        all_results = await asyncio.gather(
-            cbu_task, cbr_task, bankuz_task, themoney_task, *html_tasks,
+        gather_future = asyncio.gather(
+            cbu_task, cbr_task, bankuz_task, themoney_task, kursuz_task, *html_tasks,
             return_exceptions=True,
         )
 
-    cbu      = all_results[0] if not isinstance(all_results[0], Exception) else {}
-    cbr      = all_results[1] if not isinstance(all_results[1], Exception) else {}
-    bankuz   = all_results[2] if not isinstance(all_results[2], Exception) else {}
-    themoney = all_results[3] if not isinstance(all_results[3], Exception) else {}
-    html_results = all_results[4:]
+        # Umumiy timeout — biror manba osilib qolsa ham bot muzlab qolmaydi.
+        # Tugamagan task'lar None deb hisoblanadi, qolgan ma'lumotlar ishlatiladi.
+        overall_timeout = float(os.environ.get("REFRESH_TIMEOUT", "25"))
+        try:
+            all_results = await asyncio.wait_for(gather_future, timeout=overall_timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "refresh_all: umumiy timeout (%.0fs) — tugagan task'lar ishlatiladi",
+                overall_timeout,
+            )
+            all_tasks = [cbu_task, cbr_task, bankuz_task, themoney_task, kursuz_task, *html_tasks]
+            all_results = [
+                (t.result() if (t.done() and not t.cancelled() and not t.exception()) else None)
+                for t in all_tasks
+            ]
+            for t in all_tasks:
+                if not t.done():
+                    t.cancel()
+
+        # JS-render (brauzer) natijasi — alohida kutamiz (sessiyaga bog'liq emas)
+        js_raw: dict[str, dict] = {}
+        if js_task is not None:
+            try:
+                js_raw = await js_task
+            except Exception as e:
+                log.warning("js_render: %s", type(e).__name__)
+
+    def _ok(idx: int) -> dict:
+        v = all_results[idx]
+        return v if isinstance(v, dict) else {}
+
+    cbu      = _ok(0)
+    cbr      = _ok(1)
+    bankuz   = _ok(2)
+    themoney = _ok(3)
+    kursuz   = _ok(4)
+    html_results = all_results[5:]
 
     official_rates = {**cbu}
 
@@ -1038,18 +1505,50 @@ async def refresh_all() -> set[str]:
 
     # 2) HTML natijalar
     for res in html_results:
-        if isinstance(res, Exception):
+        if not isinstance(res, list):  # Exception yoki None (timeout/bekor qilingan) — o'tkazib yuboramiz
             continue
         for entry in res:
             pair = entry["pair"]
             if pair in new_cache:
                 new_cache[pair].append(entry)
 
+    # 2b) JS-render (brauzer) banklar — o'z saytidan, direct=True.
+    # Xom raqamlardan CB kursini (~cbu) olib tashlaymiz, qolganidan
+    # eng kichigi=buy, eng kattasi=sell. Aggregator bu entry'larni bosib o'tmaydi.
+    cbu_ruz = cbu.get("RUB_UZS")
+    for key, info in js_raw.items():
+        nums = info.get("numbers", [])
+        clean = [
+            n for n in nums
+            if not (cbu_ruz and abs(n - cbu_ruz) < 0.6)   # CB kursini tashlaymiz
+        ]
+        if not clean:
+            continue
+        buy  = min(clean) if len(clean) >= 2 else None
+        sell = max(clean)
+        stype = info.get("type", "bank")
+        nm    = info.get("name", key)
+        src_label = next((s["fetch"].get("source_label") or s["fetch"].get("url", "")
+                          for s in js_sources if s["key"] == key), "")
+        for pair, rate in (("RUB_UZS", buy), ("UZS_RUB", (1.0 / sell) if sell else None)):
+            existing = next((e for e in new_cache[pair] if e["key"] == key), None)
+            if rate is None:
+                continue
+            entry = {"key": key, "name": nm, "type": stype, "pair": pair,
+                     "rate": rate, "direct": True, "source": src_label}
+            if existing is None:
+                new_cache[pair].append(entry)
+            else:
+                existing.update(entry)
+
     # 3a) bank.uz agregator — eng yuqori ustuvorlik, har doim yangilaydi
     _apply_agg_rates(new_cache, bankuz, sources, "bank.uz", override_existing=True)
 
     # 3b) themoney.uz — faqat bank.uz da yo'q yoki bank.uz manba bo'lmaganlar uchun
     _apply_agg_rates(new_cache, themoney, sources, "themoney.uz", override_existing=False)
+
+    # 3c) kurs.uz — uchinchi zaxira agregator (bank.uz ham themoney.uz ham to'ldirolmaganlari uchun)
+    _apply_agg_rates(new_cache, kursuz, sources, "kurs.uz", override_existing=False)
 
     # Universal bank kursini taqqoslash uchun saqlash
     ub_data = themoney.get("universalbank", {})
@@ -1064,10 +1563,11 @@ async def refresh_all() -> set[str]:
     if ub_buy and float(ub_buy) > 0:
         _universal_bank_rates["RUB_UZS"] = float(ub_buy)
 
-    # 4) Pending servislar (rate=None, lekin ro'yxatda ko'rinadi)
+    # 4) Pending/aggregator servislar: aggregator to'ldirmagan bo'lsa,
+    #    ro'yxatda "ma'lumot yo'q" sifatida ko'rinadi (rate=None).
     existing_keys: dict[str, set] = {p: {e["key"] for e in new_cache[p]} for p in new_cache}
     for src in sources:
-        if src.get("fetch", {}).get("method") != "pending":
+        if src.get("fetch", {}).get("method") not in ("pending", "aggregator"):
             continue
         for pair in src.get("pairs", []):
             if pair in new_cache and src["key"] not in existing_keys.get(pair, set()):
@@ -1078,6 +1578,27 @@ async def refresh_all() -> set[str]:
                     "pair": pair,
                     "rate": None,
                 })
+
+    # 4b) Mantiqsiz kurslarni saralash (scraping xatolari: buy/sell aralashishi).
+    # Haqiqiy kurs CBU rasmiy kursi atrofida bo'ladi. Bandadan tashqari
+    # qiymatlar deyarli har doim noto'g'ri scrape qilingan — ularni chiqaramiz.
+    band_lo = float(os.environ.get("RATE_BAND_LO", "0.80"))  # CBU dan -20%
+    band_hi = float(os.environ.get("RATE_BAND_HI", "1.08"))  # CBU dan +8%
+    for pair, entries in new_cache.items():
+        cbu_rate = official_rates.get(pair)
+        if not cbu_rate or cbu_rate <= 0:
+            continue
+        lo, hi = cbu_rate * band_lo, cbu_rate * band_hi
+        for e in entries:
+            if e.get("direct"):
+                continue  # bank o'z sahifasidan — ishonamiz, filtrlamaymiz
+            r = e.get("rate")
+            if r is not None and not (lo <= r <= hi):
+                log.info(
+                    "Shubhali %s kurs chiqarildi: %s = %.4f (CBU=%.4f band=%.4f..%.4f)",
+                    pair, e["name"], r, cbu_rate, lo, hi,
+                )
+                e["rate"] = None
 
     # 5) O'sish/pasayish hisoblash + CBU farq
     db_entries:      list[tuple[str, str, float]] = []

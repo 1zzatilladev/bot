@@ -65,9 +65,12 @@ PAIR_HEADER: dict[str, str] = {
 }
 
 PAIR_DISPLAY: dict[str, dict] = {
-    "RUB_UZS": {"multiplier": 1,    "unit": "so'm",  "decimals": 3},
+    "RUB_UZS": {"multiplier": 1,    "unit": "so'm",  "decimals": 2},
     "UZS_RUB": {"multiplier": 1000, "unit": "rubl",  "decimals": 2},
 }
+
+# Reyting medallari (eng yaxshi 3 ta bank uchun)
+RANK_MEDAL: dict[int, str] = {0: "🥇", 1: "🥈", 2: "🥉"}
 
 # UZS_RUB uchun "sotish narxi" ko'rinishi (1 RUB = ? so'm)
 PAIR_SELL_LABEL: dict[str, str] = {
@@ -79,6 +82,18 @@ CHANGE_ICON: dict[str, str] = {
     "down":    "🔴",
     "same":    "⚪",
     "unknown": "⚪",
+}
+
+# Manba turi belgisi (Curso uslubida)
+#   🏦 — markaziy bank rasmiy kursi
+#   💳 — pul o'tkazma tizimi (kartaga/hisobga)
+#   💱 — bank ilovasidagi ayirboshlash kursi
+TYPE_ICON: dict[str, str] = {
+    "official": "🏦",
+    "card":     "💳",
+    "market":   "💳",
+    "transfer": "💳",
+    "bank":     "💱",
 }
 
 # Bildirishnoma yuborish uchun juftlar (faqat eng muhimlar)
@@ -147,6 +162,21 @@ def bottom_buttons() -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(inline_keyboard=[btns])
 
 
+def _support_footer() -> str:
+    """
+    Support/kanal havolalarini xabar MATNIGA qo'shadi.
+    Shunday qilib reply klaviatura (RUB↔UZS tugmalari) doim ko'rinib turadi —
+    inline klaviatura bilan band qilmaydi.
+    """
+    parts: list[str] = []
+    if CHANNEL_USERNAME:
+        ch = CHANNEL_USERNAME if CHANNEL_USERNAME.startswith("https") else f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"
+        parts.append(f'<a href="{ch}">📢 Kanalga obuna</a>')
+    if SUPPORT_URL:
+        parts.append(f'<a href="{SUPPORT_URL}">❤️ Qo\'llab-quvvatlash</a>')
+    return "\n\n" + "  ·  ".join(parts) if parts else ""
+
+
 # ─── Xabar formatlash ─────────────────────────────────────────────────────────
 
 def _fmt_rate(rate: float, pair: str) -> str:
@@ -163,116 +193,92 @@ def _fmt_rate(rate: float, pair: str) -> str:
     return f"{val:,.{cfg['decimals']}f} {cfg['unit']}".replace(",", " ")
 
 
-def _fmt_diff(rate: float, ref_rate: float, pair: str, ref_label: str = "ref") -> str:
-    """
-    Taqqoslash kursidan (Universal bank yoki CBU) farqni ko'rsatadi.
-    UZS_RUB: sell narx farqi (yuqori = qimmatroq = yomon)
-    Boshqalar: rate farqi (yuqori = ko'proq olasiz = yaxshi)
-    """
+def _rate_num(rate: float, pair: str) -> str:
+    """Curso uslubidagi raqam: '158.00' (birliksiz)."""
     if pair == "UZS_RUB":
-        # Sell narxlar: my_sell = 1/rate, ref_sell = 1/ref_rate
-        if rate <= 0 or ref_rate <= 0:
-            return ""
-        my_sell  = 1.0 / rate
-        ref_sell = 1.0 / ref_rate
-        diff     = my_sell - ref_sell   # + = qimmatroq, - = arzonroq
-        if abs(diff) < 0.05:
-            return f"≈ {ref_label}"
-        label = "qimmatroq" if diff > 0 else "arzonroq"
-        sign  = "+" if diff > 0 else ""
-        return f"{sign}{diff:.2f} so'm {label} vs {ref_label}"
-    cfg  = PAIR_DISPLAY[pair]
-    diff = (rate - ref_rate) * cfg["multiplier"]
-    if abs(diff) < 0.001:
-        return f"≈ {ref_label}"
-    sign = "+" if diff > 0 else ""
-    return f"{sign}{diff:.2f} {cfg['unit']} vs {ref_label}".replace(",", " ")
+        val = 1.0 / rate if rate > 0 else 0      # foydalanuvchiga sell narxi
+    else:
+        val = rate * PAIR_DISPLAY[pair]["multiplier"]
+    return f"{val:,.2f}".replace(",", " ")
+
+
+def _change_tag(e: dict, pair: str) -> str:
+    """
+    Oxirgi yangilanishdan beri o'zgarishni ko'rsatadi: ' 🟢 +2.00' / ' 🔴 −1.50'.
+    Yashil = foydalanuvchi uchun yaxshi tomonga, Qizil = yomon tomonga.
+    O'zgarmagan yoki yangi banklarda bo'sh qatorga qaytadi.
+    """
+    prev = e.get("prev_rate")
+    rate = e.get("rate")
+    if prev is None or rate is None or prev <= 0 or rate <= 0:
+        return ""
+    if e.get("change") not in ("up", "down"):
+        return ""
+
+    if pair == "UZS_RUB":
+        now_disp, prev_disp = 1.0 / rate, 1.0 / prev   # sell narxi
+        good = now_disp < prev_disp                     # arzonlashdi = yaxshi
+    else:
+        mult = PAIR_DISPLAY[pair]["multiplier"]
+        now_disp, prev_disp = rate * mult, prev * mult
+        good = now_disp > prev_disp                     # ko'paydi = yaxshi
+
+    delta = now_disp - prev_disp
+    if abs(delta) < 0.01:
+        return ""
+    icon = "🟢" if good else "🔴"
+    sign = "+" if delta > 0 else "−"
+    return f"  {icon} {sign}{abs(delta):.2f}"
 
 
 def build_rates_message(pair: str, is_notification: bool = False) -> str:
     """
-    Har bir bank uchun: kurs + Universal bank bilan farq + o'sish/pasayish belgisi.
-    RUB_UZS: yuqori = yaxshi (ko'proq so'm olasiz)
-    UZS_RUB: past = yaxshi (arzonroq RUB sotib olasiz)
+    Curso uslubidagi toza ro'yxat:
+        158.00 | 💱 Asia Alliance Bank
+    Eng yaxshi kurs tepada. Tur belgisi: 🏦 rasmiy · 💳 o'tkazma · 💱 bank ilovasi.
     """
-    entries   = fetcher.get_cached(pair) or []
-    cbu_rate  = fetcher.get_cbu_official(pair)
-    ref_rate  = fetcher.get_reference_rate(pair)
-    ref_label = fetcher.get_reference_label(pair)
-    ts        = fetcher.get_cache_time()
-    ts_str    = ts.strftime("%d.%m.%Y %H:%M") if ts else "—"
+    entries = fetcher.get_cached(pair) or []
+    ts      = fetcher.get_cache_time()
+    ts_str  = ts.strftime("%d.%m.%Y · %H:%M") if ts else "—"
 
-    prefix = "⚡ <b>Kurs yangilandi!</b>\n\n" if is_notification else ""
+    prefix   = "⚡ <b>Kurs yangilandi!</b>\n" if is_notification else ""
+    subtitle = (
+        "<i>Eng ko'p so'm beruvchi tepada 👆</i>"
+        if pair == "RUB_UZS" else
+        "<i>Eng arzon RUB beruvchi tepada 👆</i>"
+    )
 
-    # Sarlavha va izoh
-    if pair == "RUB_UZS":
-        subtitle = "<i>1 RUBga ko'proq so'm beruvchi bank — qatorning tepasida</i>"
-    else:
-        subtitle = "<i>1 RUB uchun kamroq so'm oluvchi bank — qatorning tepasida</i>"
-
-    lines = [
-        f"{prefix}{PAIR_HEADER[pair]}",
-        subtitle,
-        f"🕐 {ts_str}",
-    ]
-
-    # CBU rasmiy kursi + Universal bank taqqoslash kursi
-    if cbu_rate:
-        cbu_str = _fmt_rate(cbu_rate, pair)
-        lines.append(f"🏛 CBU rasmiy: <b>{cbu_str}</b>")
-    if ref_rate and ref_label == "Universal bank":
-        ref_str = _fmt_rate(ref_rate, pair)
-        lines.append(f"🏦 Universal bank: <b>{ref_str}</b>  <i>(taqqoslash asosi)</i>")
-
-    lines.append("")
+    lines = [f"{prefix}{PAIR_HEADER[pair]}", subtitle, f"🕐 {ts_str}", ""]
 
     if not entries:
-        lines.append("⏳ <i>Kurslar olinmoqda, iltimos kutib turing...</i>")
+        lines.append("⏳ <i>Kurslar olinmoqda, biroz kuting...</i>")
         return "\n".join(lines)
 
     ok_entries = [e for e in entries if e.get("rate") is not None]
     no_entries = [e for e in entries if e.get("rate") is None]
 
     if not ok_entries:
-        lines.append("⚠️ <i>Hozircha ma'lumot yo'q. Iltimos, bir muddan so'ng qayta urinib ko'ring.</i>")
+        lines.append("⚠️ <i>Hozircha ma'lumot yo'q. Birozdan so'ng qayta urinib ko'ring.</i>")
         return "\n".join(lines)
 
-    # Rasmiy kurslar alohida
-    official = [e for e in ok_entries if e.get("type") == "official"]
-    banks    = [e for e in ok_entries if e.get("type") != "official"]
+    # Ro'yxat allaqachon foydalilik bo'yicha tartiblangan (fetcher tomonidan)
+    for e in ok_entries:
+        icon     = TYPE_ICON.get(e.get("type", "bank"), "💱")
+        rate_str = _rate_num(e["rate"], pair)
+        change   = _change_tag(e, pair)
+        lines.append(f"<b>{rate_str}</b> | {icon} {e['name']}{change}")
 
-    for e in official:
-        rate     = e["rate"]
-        icon     = CHANGE_ICON.get(e.get("change", "unknown"), "⚪")
-        rate_str = _fmt_rate(rate, pair)
-        lines.append(f"{icon} 🏦 <b>{e['name']}</b> — <b>{rate_str}</b>")
+    # Izoh (legend)
+    lines.append("")
+    lines.append("🏦 — markaziy bank · 💳 — o'tkazma · 💱 — bank ilovasi")
+    lines.append("🟢/🔴 — oxirgi yangilanishdan beri o'zgarish")
 
-    if official:
-        lines.append("")
-
-    # Banklar (Universal bank bilan farq ko'rsatiladi)
-    for e in banks:
-        rate     = e["rate"]
-        icon     = CHANGE_ICON.get(e.get("change", "unknown"), "⚪")
-        rate_str = _fmt_rate(rate, pair)
-
-        # Universal bank yoki CBU bilan taqqoslash
-        if ref_rate and ref_rate > 0 and e.get("key") != "universalbank":
-            diff_str = _fmt_diff(rate, ref_rate, pair, ref_label)
-            extra    = f"  <i>({diff_str})</i>" if diff_str else ""
-        else:
-            extra = ""
-
-        lines.append(f"{icon} <b>{e['name']}</b> — {rate_str}{extra}")
-
-    # Ma'lumot yo'q banklar — faqat UZS_RUB yoki umumiy ko'rinishlar uchun ko'rsatamiz.
+    # Ma'lumot yo'q banklar — faqat UZS_RUB uchun, ixcham
     if no_entries and pair != "RUB_UZS":
-        lines.append("")
-        lines.append(f"<i>Ma'lumot yo'q ({len(no_entries)} ta):</i>")
         names = ", ".join(e["name"] for e in no_entries[:6])
         if len(no_entries) > 6:
             names += f" va yana {len(no_entries) - 6} ta"
-        lines.append(f"<i>{names}</i>")
+        lines.append(f"\n<i>ℹ️ Ma'lumot yo'q: {names}</i>")
 
     return "\n".join(lines)
 
@@ -291,14 +297,14 @@ async def send_notifications(bot: Bot, pairs: set[str], is_change: bool = False)
     for pair in sorted(pairs):
         if pair not in NOTIFY_PAIRS:
             continue
-        text   = build_rates_message(pair, is_notification=is_change)
-        markup = bottom_buttons()
+        text = build_rates_message(pair, is_notification=is_change) + _support_footer()
         for user_id in list(_users):
             try:
                 await bot.send_message(
                     user_id, text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                    reply_markup=main_keyboard(),   # tugmalar doim ko'rinib tursin
                 )
                 await asyncio.sleep(0.05)
             except Exception as e:
@@ -375,12 +381,12 @@ async def handle_pair_button(message: Message) -> None:
         except Exception:
             pass
         await wait_msg.delete()
-    text   = build_rates_message(pair)
-    markup = bottom_buttons()
+    text = build_rates_message(pair) + _support_footer()
     await message.answer(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=markup or main_keyboard(),
+        disable_web_page_preview=True,
+        reply_markup=main_keyboard(),   # RUB↔UZS tugmalari doim ko'rinib tursin
     )
 
 
