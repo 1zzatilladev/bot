@@ -241,5 +241,15 @@
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
     "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "uzum",
+    "name": "UZUM Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": {
+      "method": "aggregator",
+      "_comment": "onmap.uz API (api.onmap.uz/api/rates slug=uzumbank) zaxira; Playwright o'rnatilsa js_render ga o'tish mumkin: uzumbank.uz/ru/?currency=true"
+    }
   }
 ]

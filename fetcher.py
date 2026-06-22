@@ -105,8 +105,7 @@ _BANK_KEY_MAP: list[tuple[str, str]] = [
     ("davr",                      "davrbank"),
     ("kdb",                       "kdb"),
     ("apex",                      "apexbank"),
-    ("unired",                    "unired"),
-    ("mpay",                      "mpay"),
+    ("uzum",                      "uzum"),
     ("salamplay",                 "salamplay"),
     ("salam pay",                 "salamplay"),
     ("koronapay",                 "koronapay"),
@@ -997,6 +996,125 @@ async def _fetch_kursuz_rub(
 
 
 # ---------------------------------------------------------------------------
+# ONMAP.UZ AGREGATOR — api.onmap.uz/api/rates dan barcha banklar kursi
+# ---------------------------------------------------------------------------
+
+# onmap.uz slug → bizning source key moslamasi
+_ONMAP_SLUG_MAP: dict[str, str] = {
+    "aab":            "aab",
+    "agrobank":       "agrobank",
+    "aloqabank":      "aloqabank",
+    "anorbank":       "anorbank",
+    "asakabank":      "asakabank",
+    "garantbank":     "garantbank",
+    "hamkorbank":     "hamkorbank",
+    "hayotbank":      "hayotbank",
+    "infinbank":      "infinbank",
+    "ipakyulibank":   "ipakyuli",
+    "ipotekabank":    "ipotekabank",
+    "kapitalbank":    "kapitalbank",
+    "mikrokreditbank": "mkbank",
+    "nbu":            "nbu",
+    "ofb":            "ofb",
+    "poytaxtbank":    "poytaxtbank",
+    "brb":            "brb",
+    "octobank":       "octobank",
+    "tengebank":      "tengebank",
+    "trustbank":      "trustbank",
+    "turonbank":      "turonbank",
+    "universalbank":  "universalbank",
+    "sqb":            "sqb",
+    "uzumbank":       "uzum",
+    "cbu":            "cbu",
+}
+
+_onmap_hash: Optional[str] = None
+_onmap_cached: dict[str, dict] = {}
+
+
+async def _fetch_onmap_api(
+    session: aiohttp.ClientSession,
+    retries: int = 3,
+) -> dict[str, dict[str, float | str]]:
+    """
+    api.onmap.uz/api/rates dan barcha banklarning RUB kurslarini oladi.
+    Qaytaradi: {key: {"name": str, "buy": float|None, "sell": float|None}, ...}
+    "no data" va bo'sh qatorlar None sifatida qaytariladi.
+    """
+    global _onmap_hash, _onmap_cached
+
+    url = "https://api.onmap.uz/api/rates"
+    last_exc: Exception = RuntimeError("no attempt")
+
+    for attempt in range(retries):
+        try:
+            async with session.get(
+                url,
+                headers={**HEADERS, "Accept": "application/json"},
+                timeout=TIMEOUT,
+            ) as r:
+                if r.status != 200:
+                    log.warning("onmap.uz HTTP %d (urinish %d/%d)", r.status, attempt + 1, retries)
+                    if r.status < 500:
+                        return {}
+                    raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status)
+                raw_bytes = await r.read()
+
+            content_hash = hashlib.md5(raw_bytes).hexdigest()
+            if content_hash == _onmap_hash and _onmap_cached:
+                log.debug("onmap.uz: kontent o'zgarmagan, kesh ishlatildi")
+                return _onmap_cached
+
+            data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+            banks = data.get("currencies", [])
+
+            out: dict[str, dict] = {}
+            for bank in banks:
+                slug = bank.get("slug", "")
+                key  = _ONMAP_SLUG_MAP.get(slug)
+                if key is None:
+                    continue
+                rub = bank.get("currencies", {}).get("RUB", {})
+
+                def _parse_onmap(val) -> Optional[float]:
+                    if not val or str(val).strip() in ("", "no data"):
+                        return None
+                    clean = re.sub(r"\s+", "", str(val)).replace(",", ".")
+                    try:
+                        v = float(clean)
+                        return v if 10 < v < 5000 else None
+                    except ValueError:
+                        return None
+
+                buy  = _parse_onmap(rub.get("buying"))
+                sell = _parse_onmap(rub.get("selling"))
+                if buy is None and sell is None:
+                    continue
+                out[key] = {
+                    "name": bank.get("full_title", slug),
+                    "buy":  buy,
+                    "sell": sell,
+                }
+
+            _onmap_hash   = content_hash
+            _onmap_cached = out
+            buy_cnt  = sum(1 for v in out.values() if v.get("buy"))
+            sell_cnt = sum(1 for v in out.values() if v.get("sell"))
+            log.info("onmap.uz: %d bank RUB kursi olindi (buy=%d, sell=%d)",
+                     len(out), buy_cnt, sell_cnt)
+            return out
+
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                log.warning("onmap.uz qayta urinish %d/%d: %s", attempt + 1, retries, e)
+                await asyncio.sleep(1)
+
+    log.warning("onmap.uz: %d urinishdan keyin muvaffaqiyatsiz — %s", retries, last_exc)
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # BITTA SERVIS UCHUN KURS OLISH
 # ---------------------------------------------------------------------------
 
@@ -1140,6 +1258,7 @@ async def refresh_all() -> set[str]:
         bankuz_task   = asyncio.create_task(_fetch_bankuz_rub(session))
         themoney_task = asyncio.create_task(_fetch_themoney_rub(session))
         kursuz_task   = asyncio.create_task(_fetch_kursuz_rub(session))
+        onmap_task    = asyncio.create_task(_fetch_onmap_api(session))
         # JS-render banklar (Playwright, brauzer) — alohida, o'z timeout'i bilan
         js_timeout = float(os.environ.get("JS_RENDER_TIMEOUT", "40"))
         js_task = asyncio.create_task(
@@ -1167,7 +1286,7 @@ async def refresh_all() -> set[str]:
         ]
 
         gather_future = asyncio.gather(
-            cbu_task, cbr_task, bankuz_task, themoney_task, kursuz_task, *html_tasks,
+            cbu_task, cbr_task, bankuz_task, themoney_task, kursuz_task, onmap_task, *html_tasks,
             return_exceptions=True,
         )
 
@@ -1181,7 +1300,7 @@ async def refresh_all() -> set[str]:
                 "refresh_all: umumiy timeout (%.0fs) — tugagan task'lar ishlatiladi",
                 overall_timeout,
             )
-            all_tasks = [cbu_task, cbr_task, bankuz_task, themoney_task, kursuz_task, *html_tasks]
+            all_tasks = [cbu_task, cbr_task, bankuz_task, themoney_task, kursuz_task, onmap_task, *html_tasks]
             all_results = [
                 (t.result() if (t.done() and not t.cancelled() and not t.exception()) else None)
                 for t in all_tasks
@@ -1207,7 +1326,8 @@ async def refresh_all() -> set[str]:
     bankuz   = _ok(2)
     themoney = _ok(3)
     kursuz   = _ok(4)
-    html_results = all_results[5:]
+    onmap    = _ok(5)
+    html_results = all_results[6:]
 
     official_rates = {**cbu}
 
@@ -1280,6 +1400,9 @@ async def refresh_all() -> set[str]:
 
     # 3c) kurs.uz — uchinchi zaxira agregator (bank.uz ham themoney.uz ham to'ldirolmaganlari uchun)
     _apply_agg_rates(new_cache, kursuz, sources, "kurs.uz", override_existing=False)
+
+    # 3d) onmap.uz — to'rtinchi zaxira agregator (Uzum Bank va boshqalar uchun)
+    _apply_agg_rates(new_cache, onmap, sources, "onmap.uz", override_existing=False)
 
     # Universal bank kursini taqqoslash uchun saqlash
     ub_data = themoney.get("universalbank", {})
