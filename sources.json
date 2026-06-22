@@ -222,7 +222,11 @@
     "name": "Octobank",
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
-    "fetch": { "method": "aggregator" }
+    "fetch": {
+      "method": "html_scrape",
+      "url": "https://octobank.uz/en/interactive-services/kurs-valyut",
+      "source_label": "octobank.uz"
+    }
   },
   {
     "key": "tengebank",
