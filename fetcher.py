@@ -93,6 +93,8 @@ _BANK_KEY_MAP: list[tuple[str, str]] = [
     ("tenge",                     "tengebank"),
     ("mkbank",                    "mkbank"),
     ("mikrokreditbank",           "mkbank"),
+    ("mybank",                    "mybank"),
+    ("my bank",                   "mybank"),
     ("madad",                     "madadbank"),  # themoney.uz nomi
     ("brb",                       "brb"),
     ("qishloq qurilish",          "brb"),
@@ -1106,6 +1108,9 @@ _ONMAP_SLUG_MAP: dict[str, str] = {
     "sqb":            "sqb",
     "uzumbank":       "uzum",
     "cbu":            "cbu",
+    "apexbank":       "apexbank",
+    "mybank":         "mybank",
+    "xalqbank":       "xalqbank",
 }
 
 _onmap_hash: Optional[str] = None
