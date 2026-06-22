@@ -254,6 +254,34 @@
     }
   },
   {
+    "key": "apexbank",
+    "name": "Apex Bank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "mybank",
+    "name": "MyBank",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "mkbank",
+    "name": "MKBank (Mikrokreditbank)",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
+    "key": "xalqbank",
+    "name": "Xalq Banki",
+    "type": "bank",
+    "pairs": ["RUB_UZS", "UZS_RUB"],
+    "fetch": { "method": "aggregator" }
+  },
+  {
     "key": "uzum_uzumcard",
     "name": "UZUM Bank c Uzum Card",
     "type": "card",
