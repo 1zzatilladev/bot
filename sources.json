@@ -248,8 +248,29 @@
     "type": "bank",
     "pairs": ["RUB_UZS", "UZS_RUB"],
     "fetch": {
-      "method": "aggregator",
-      "_comment": "onmap.uz API (api.onmap.uz/api/rates slug=uzumbank) zaxira; Playwright o'rnatilsa js_render ga o'tish mumkin: uzumbank.uz/ru/?currency=true"
+      "method": "onmap_converter_api",
+      "bank_id": 36,
+      "_comment": "api.onmap.uz/api/converter — Uzum Bank (bank_id=36). To'g'ridan-to'g'ri kurs."
+    }
+  },
+  {
+    "key": "uzum_uzumcard",
+    "name": "UZUM Bank c Uzum Card",
+    "type": "card",
+    "pairs": ["RUB_UZS"],
+    "fetch": {
+      "method": "uzum_transfer_scrape",
+      "card_type": "uzum"
+    }
+  },
+  {
+    "key": "uzum_humocard",
+    "name": "UZUM Bank c Humo/Uzcard",
+    "type": "card",
+    "pairs": ["RUB_UZS"],
+    "fetch": {
+      "method": "uzum_transfer_scrape",
+      "card_type": "humo"
     }
   }
 ]

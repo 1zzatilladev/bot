@@ -20,7 +20,6 @@ import hashlib
 import json
 import logging
 import re
-import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -433,6 +432,11 @@ _cbu_official: dict[str, float] = {}
 _universal_bank_rates: dict[str, float] = {}
 CACHE_TTL = 600  # 10 daqiqa
 
+# UZUM Bank transfer kurslari keshi (Playwright)
+_uzum_transfer_cache: Optional[tuple[Optional[float], Optional[float]]] = None
+_uzum_transfer_cache_time: Optional[datetime] = None
+_uzum_transfer_lock: Optional[asyncio.Lock] = None
+
 # Oxirgi MA'LUM qiymat: manba vaqtincha ishlamasa, bank yo'qolib qolmasligi uchun.
 # {(key, pair): (rate, datetime)} — faqat haqiqiy (None bo'lmagan) qiymatlar saqlanadi.
 _last_good: dict[tuple[str, str], tuple[float, datetime]] = {}
@@ -448,18 +452,9 @@ def get_cache_time() -> Optional[datetime]:
     return _cache_time
 
 
-def get_cbu_official(pair: str) -> Optional[float]:
-    return _cbu_official.get(pair)
-
-
 def get_reference_rate(pair: str) -> Optional[float]:
     """Taqqoslash kursi: avval Universal bank, yo'q bo'lsa CBU."""
     return _universal_bank_rates.get(pair) or _cbu_official.get(pair)
-
-
-def get_reference_label(pair: str) -> str:
-    """Taqqoslash manbasining nomi."""
-    return "Universal bank" if _universal_bank_rates.get(pair) else "CBU"
 
 
 # ---------------------------------------------------------------------------
@@ -503,43 +498,6 @@ async def _fetch_cbu(session: aiohttp.ClientSession, retries: int = 3) -> dict[s
                 log.warning("CBU qayta urinish %d/%d: %s", attempt + 1, retries, e)
                 await asyncio.sleep(1)
     log.warning("CBU: %d urinishdan keyin muvaffaqiyatsiz — %s", retries, last_exc)
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# CBR — Rossiya Markaziy Banki (XML)
-# ---------------------------------------------------------------------------
-
-async def _fetch_cbr(session: aiohttp.ClientSession, retries: int = 3) -> dict[str, float]:
-    last_exc: Exception = RuntimeError("no attempt")
-    for attempt in range(retries):
-        try:
-            async with session.get(
-                "https://www.cbr.ru/scripts/XML_daily.asp",
-                headers=HEADERS, timeout=TIMEOUT,
-            ) as r:
-                text = await r.text(encoding="windows-1251")
-
-            root = ET.fromstring(text)
-            raw: dict[str, float] = {}
-            for valute in root.findall("Valute"):
-                code    = (valute.findtext("CharCode") or "").upper()
-                nom     = float((valute.findtext("Nominal") or "1").replace(",", "."))
-                val     = float((valute.findtext("Value")   or "0").replace(",", "."))
-                raw[code] = val / nom
-
-            out: dict[str, float] = {}
-            if "USD" in raw:
-                out["USD_RUB"] = raw["USD"]
-                out["RUB_USD"] = 1.0 / raw["USD"]
-            log.info("CBR: USD=%.2f RUB/USD", raw.get("USD", 0))
-            return out
-        except Exception as e:
-            last_exc = e
-            if attempt < retries - 1:
-                log.warning("CBR qayta urinish %d/%d: %s", attempt + 1, retries, e)
-                await asyncio.sleep(1)
-    log.warning("CBR: %d urinishdan keyin muvaffaqiyatsiz — %s", retries, last_exc)
     return {}
 
 
@@ -891,6 +849,128 @@ async def _fetch_hayotbank_api(
 
 
 # ---------------------------------------------------------------------------
+# UZUM BANK TRANSFER — Playwright orqali Uzum Card va Humo/Uzcard kurslari
+# ---------------------------------------------------------------------------
+
+async def _fetch_uzum_transfer_rates() -> tuple[Optional[float], Optional[float]]:
+    """
+    UZUM Bank transfer sahifasidan Playwright orqali Uzum Card va Humo/Uzcard
+    kurslarini oladi. Avval network interception sinab ko'riladi (API catch),
+    keyin HTML matnidan qidirish. Qaytaradi: (uzum_card_rate, humo_uzcard_rate).
+    Playwright o'rnatilmagan yoki sahifa yuklanmasa — (None, None).
+    """
+    global _uzum_transfer_cache, _uzum_transfer_cache_time, _uzum_transfer_lock
+
+    if _uzum_transfer_lock is None:
+        _uzum_transfer_lock = asyncio.Lock()
+
+    async with _uzum_transfer_lock:
+        now = datetime.now()
+        if (
+            _uzum_transfer_cache is not None
+            and _uzum_transfer_cache_time
+            and (now - _uzum_transfer_cache_time).total_seconds() < CACHE_TTL
+        ):
+            return _uzum_transfer_cache
+
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            log.warning("Playwright yo'q — UZUM transfer kurslari olinmadi")
+            return (None, None)
+
+        url = "https://uzumbank.uz/ru/transfers/"
+        nav_timeout = int(os.environ.get("JS_NAV_TIMEOUT", "30000"))
+
+        captured: dict[str, float] = {}
+
+        async def _intercept(response) -> None:
+            """API network responselaridan kursni ushlaymiz."""
+            try:
+                ct = response.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                text = await response.text()
+                data = json.loads(text)
+                if not isinstance(data, dict):
+                    return
+                for k, v in data.items():
+                    kl = k.lower()
+                    if ("uzum" in kl and "card" in kl) or "uzumcard" in kl:
+                        try:
+                            fv = float(v)
+                            if 50 < fv < 500:
+                                captured["uzum"] = fv
+                        except (TypeError, ValueError):
+                            pass
+                    elif "humo" in kl or "uzcard" in kl:
+                        try:
+                            fv = float(v)
+                            if 50 < fv < 500:
+                                captured["humo"] = fv
+                        except (TypeError, ValueError):
+                            pass
+            except Exception:
+                pass
+
+        html = ""
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True)
+                ctx = await browser.new_context(user_agent=HEADERS["User-Agent"])
+                page = await ctx.new_page()
+                page.on("response", _intercept)
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=nav_timeout)
+                    await page.wait_for_timeout(3000)
+                    html = await page.content()
+                except Exception as e:
+                    log.warning("UZUM transfer sahifa: %s", type(e).__name__)
+                finally:
+                    await page.close()
+                await browser.close()
+        except Exception as e:
+            log.warning("UZUM transfer Playwright: %s", e)
+            return (None, None)
+
+        uzum_rate: Optional[float] = captured.get("uzum")
+        humo_rate: Optional[float] = captured.get("humo")
+
+        # Agar network dan tutmadi — HTML matnidan qidirish
+        if uzum_rate is None or humo_rate is None:
+            soup = BeautifulSoup(html, _PARSER)
+            full_text = soup.get_text(" ", strip=True)
+
+            def _near_rate(keyword: str) -> Optional[float]:
+                pat = re.compile(
+                    re.escape(keyword) + r"[\s\S]{0,300}?"
+                    r"(\d{2,3}(?:\s\d{3})*(?:[.,]\d+)?)"
+                    r"\s*(?:so['’]?m|сўм|сум|UZS|[Сс][уў]м)",
+                    re.IGNORECASE,
+                )
+                for m in pat.finditer(full_text):
+                    try:
+                        v = float(re.sub(r"\s+", "", m.group(1)).replace(",", "."))
+                        if 50 < v < 500:
+                            return v
+                    except ValueError:
+                        continue
+                return None
+
+            uzum_rate = uzum_rate or _near_rate("Uzum Card")
+            humo_rate = humo_rate or _near_rate("Humo")
+
+        result: tuple[Optional[float], Optional[float]] = (
+            uzum_rate if uzum_rate and 50 < uzum_rate < 500 else None,
+            humo_rate  if humo_rate  and 50 < humo_rate  < 500 else None,
+        )
+        _uzum_transfer_cache      = result
+        _uzum_transfer_cache_time = now
+        log.info("UZUM transfer: uzum_card=%s humo_uzcard=%s", result[0], result[1])
+        return result
+
+
+# ---------------------------------------------------------------------------
 # WISE API — bepul mid-market kurs (barcha juftlar)
 # ---------------------------------------------------------------------------
 
@@ -1030,6 +1110,58 @@ _ONMAP_SLUG_MAP: dict[str, str] = {
 
 _onmap_hash: Optional[str] = None
 _onmap_cached: dict[str, dict] = {}
+
+
+async def _fetch_onmap_converter(
+    session: aiohttp.ClientSession,
+    bank_id: int,
+    retries: int = 3,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    api.onmap.uz/api/converter orqali bitta bank uchun RUB kursini oladi.
+    Qaytaradi: (buy_rate, sell_rate) — RUB_UZS uchun UZS qiymati.
+      buy  = type:"sell" → siz RUB berasiz, UZS olasiz (RUB_UZS)
+      sell = type:"buy"  → siz UZS berasiz, RUB olasiz (UZS_RUB uchun 1/sell)
+    """
+    url = "https://api.onmap.uz/api/converter"
+    headers = {**HEADERS, "Content-Type": "application/json", "Accept": "application/json"}
+    buy_rate: Optional[float] = None
+    sell_rate: Optional[float] = None
+
+    for rtype, store in (("buy", "buy"), ("sell", "sell")):
+        payload = {"from_c": "RUB", "to_c": "UZS", "bank": bank_id, "type": rtype, "amount": 1000}
+        last_exc: Exception = RuntimeError("no attempt")
+        for attempt in range(retries):
+            try:
+                async with session.post(
+                    url, json=payload, headers=headers, timeout=TIMEOUT,
+                ) as r:
+                    if r.status != 200:
+                        log.warning("onmap converter HTTP %d (bank=%d type=%s urinish %d/%d)",
+                                    r.status, bank_id, rtype, attempt + 1, retries)
+                        if r.status < 500:
+                            break
+                        raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status)
+                    data = await r.json(content_type=None)
+                converted = data.get("converted_amount")
+                if converted and float(converted) > 10:
+                    rate = float(converted) / 1000.0
+                    if store == "buy":
+                        buy_rate = rate
+                    else:
+                        sell_rate = rate
+                break
+            except Exception as e:
+                last_exc = e
+                if attempt < retries - 1:
+                    log.warning("onmap converter qayta urinish %d/%d (bank=%d type=%s): %s",
+                                attempt + 1, retries, bank_id, rtype, e)
+                    await asyncio.sleep(0.5)
+        else:
+            log.warning("onmap converter: %d urinishdan keyin muvaffaqiyatsiz (bank=%d type=%s) — %s",
+                        retries, bank_id, rtype, last_exc)
+
+    return buy_rate, sell_rate
 
 
 async def _fetch_onmap_api(
@@ -1226,6 +1358,37 @@ async def _fetch_service_pairs(
             })
         return results
 
+    if method == "uzum_transfer_scrape":
+        card_type = fetch.get("card_type", "uzum")
+        uzum_rate, humo_rate = await _fetch_uzum_transfer_rates()
+        rate = uzum_rate if card_type == "uzum" else humo_rate
+        for pair in pairs:
+            if pair == "RUB_UZS":
+                results.append({
+                    "key":  key,
+                    "name": name,
+                    "type": stype,
+                    "pair": pair,
+                    "rate": rate,
+                })
+        return results
+
+    if method == "onmap_converter_api":
+        bank_id = fetch.get("bank_id", 36)
+        buy_rate, sell_rate = await _fetch_onmap_converter(session, bank_id)
+        for pair in pairs:
+            rate: Optional[float] = None
+            if pair == "RUB_UZS":
+                rate = buy_rate
+            elif pair == "UZS_RUB":
+                rate = (1.0 / sell_rate) if sell_rate else None
+            entry = {"key": key, "name": name, "type": stype, "pair": pair, "rate": rate}
+            if rate is not None:
+                entry["direct"] = True
+                entry["source"] = "onmap.uz/converter"
+            results.append(entry)
+        return results
+
     return []
 
 
@@ -1247,6 +1410,7 @@ async def refresh_all() -> set[str]:
         if s.get("fetch", {}).get("method") in (
             "html_scrape", "koronapay_api", "wise_api",
             "hamkorbank_api", "tengebank_api", "hayotbank_api",
+            "uzum_transfer_scrape", "onmap_converter_api",
         )
     ]
     js_sources = [s for s in sources if s.get("fetch", {}).get("method") == "js_render"]
@@ -1254,7 +1418,6 @@ async def refresh_all() -> set[str]:
     async with aiohttp.ClientSession() as session:
         # Barcha fetch'larni bir vaqtda boshlaymiz (parallel)
         cbu_task      = asyncio.create_task(_fetch_cbu(session))
-        cbr_task      = asyncio.create_task(_fetch_cbr(session))
         bankuz_task   = asyncio.create_task(_fetch_bankuz_rub(session))
         themoney_task = asyncio.create_task(_fetch_themoney_rub(session))
         kursuz_task   = asyncio.create_task(_fetch_kursuz_rub(session))
@@ -1286,7 +1449,7 @@ async def refresh_all() -> set[str]:
         ]
 
         gather_future = asyncio.gather(
-            cbu_task, cbr_task, bankuz_task, themoney_task, kursuz_task, onmap_task, *html_tasks,
+            cbu_task, bankuz_task, themoney_task, kursuz_task, onmap_task, *html_tasks,
             return_exceptions=True,
         )
 
@@ -1300,7 +1463,7 @@ async def refresh_all() -> set[str]:
                 "refresh_all: umumiy timeout (%.0fs) — tugagan task'lar ishlatiladi",
                 overall_timeout,
             )
-            all_tasks = [cbu_task, cbr_task, bankuz_task, themoney_task, kursuz_task, onmap_task, *html_tasks]
+            all_tasks = [cbu_task, bankuz_task, themoney_task, kursuz_task, onmap_task, *html_tasks]
             all_results = [
                 (t.result() if (t.done() and not t.cancelled() and not t.exception()) else None)
                 for t in all_tasks
@@ -1322,12 +1485,11 @@ async def refresh_all() -> set[str]:
         return v if isinstance(v, dict) else {}
 
     cbu      = _ok(0)
-    cbr      = _ok(1)
-    bankuz   = _ok(2)
-    themoney = _ok(3)
-    kursuz   = _ok(4)
-    onmap    = _ok(5)
-    html_results = all_results[6:]
+    bankuz   = _ok(1)
+    themoney = _ok(2)
+    kursuz   = _ok(3)
+    onmap    = _ok(4)
+    html_results = all_results[5:]
 
     official_rates = {**cbu}
 
@@ -1339,7 +1501,7 @@ async def refresh_all() -> set[str]:
     # 1) Rasmiy (CBU + CBR) kurslar
     for src in sources:
         method = src.get("fetch", {}).get("method")
-        if method not in ("cbu_api", "cbr_xml"):
+        if method != "cbu_api":
             continue
         for pair in src.get("pairs", []):
             rate = cbu.get(pair)
