@@ -4,3 +4,5 @@ beautifulsoup4==4.12.3
 lxml>=5.3
 python-dotenv==1.0.1
 playwright==1.60.0
+fastapi==0.115.6
+uvicorn==0.34.0

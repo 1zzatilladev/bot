@@ -84,69 +84,6 @@ def save_history(entries: list[tuple[str, str, float]]) -> None:
         conn.commit()
 
 
-def get_history(
-    svc_key: str,
-    pair: str,
-    limit: int = 200,
-    since: Optional[str] = None,
-) -> list[tuple[str, float]]:
-    """
-    Bitta bank uchun kurs tarixini qaytaradi.
-    Qaytaradi: [(recorded_at_iso, rate), ...] yangi → eski tartibida.
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        if since:
-            rows = conn.execute(
-                """
-                SELECT recorded_at, rate FROM rate_history
-                WHERE svc_key = ? AND pair = ? AND recorded_at >= ?
-                ORDER BY recorded_at DESC LIMIT ?
-                """,
-                (svc_key, pair, since, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT recorded_at, rate FROM rate_history
-                WHERE svc_key = ? AND pair = ?
-                ORDER BY recorded_at DESC LIMIT ?
-                """,
-                (svc_key, pair, limit),
-            ).fetchall()
-    return [(r[0], float(r[1])) for r in rows]
-
-
-def get_all_history(
-    pair: str,
-    limit: int = 2000,
-    since: Optional[str] = None,
-) -> list[tuple[str, str, float]]:
-    """
-    Barcha banklar uchun kurs tarixini qaytaradi.
-    Qaytaradi: [(svc_key, recorded_at, rate), ...] yangi → eski.
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        if since:
-            rows = conn.execute(
-                """
-                SELECT svc_key, recorded_at, rate FROM rate_history
-                WHERE pair = ? AND recorded_at >= ?
-                ORDER BY recorded_at DESC LIMIT ?
-                """,
-                (pair, since, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT svc_key, recorded_at, rate FROM rate_history
-                WHERE pair = ?
-                ORDER BY recorded_at DESC LIMIT ?
-                """,
-                (pair, limit),
-            ).fetchall()
-    return [(r[0], r[1], float(r[2])) for r in rows]
-
-
 def purge_old_history(days: int = 30) -> int:
     """30 kundan eski tarix yozuvlarini o'chiradi. O'chirilgan satr sonini qaytaradi."""
     with sqlite3.connect(DB_PATH) as conn:

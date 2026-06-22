@@ -20,8 +20,6 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -68,21 +66,6 @@ PAIR_HEADER: dict[str, str] = {
 PAIR_DISPLAY: dict[str, dict] = {
     "RUB_UZS": {"multiplier": 1,    "unit": "so'm",  "decimals": 2},
     "UZS_RUB": {"multiplier": 1000, "unit": "rubl",  "decimals": 2},
-}
-
-# Reyting medallari (eng yaxshi 3 ta bank uchun)
-RANK_MEDAL: dict[int, str] = {0: "🥇", 1: "🥈", 2: "🥉"}
-
-# UZS_RUB uchun "sotish narxi" ko'rinishi (1 RUB = ? so'm)
-PAIR_SELL_LABEL: dict[str, str] = {
-    "UZS_RUB": "so'm/RUB",  # sell narxi: qancha so'm to'laysiz 1 RUB uchun
-}
-
-CHANGE_ICON: dict[str, str] = {
-    "up":      "🟢",
-    "down":    "🔴",
-    "same":    "⚪",
-    "unknown": "⚪",
 }
 
 # Manba turi belgisi (Curso uslubida)
@@ -153,18 +136,6 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         persistent=True,
     )
-
-
-def bottom_buttons() -> Optional[InlineKeyboardMarkup]:
-    btns: list[InlineKeyboardButton] = []
-    if SUPPORT_URL:
-        btns.append(InlineKeyboardButton(text="❤️ Loyihani qo'llab-quvvatlash", url=SUPPORT_URL))
-    if CHANNEL_USERNAME:
-        ch = CHANNEL_USERNAME if CHANNEL_USERNAME.startswith("https") else f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"
-        btns.append(InlineKeyboardButton(text="📢 Kanalga obuna", url=ch))
-    if not btns:
-        return None
-    return InlineKeyboardMarkup(inline_keyboard=[btns])
 
 
 def _support_footer() -> str:
@@ -292,9 +263,12 @@ def build_rates_message(pair: str, is_notification: bool = False) -> str:
         change   = _change_tag(e, pair)      # ▲/▼ oxirgi o'zgarish
         lines.append(f"<b>{rate_str}</b> | {icon} {e['name']}{vs_ref}{change}")
 
-    # Izoh (legend)
+    # Izoh (legend) — Curso uslubida
     lines.append("")
     lines.append("(  ) — Universal bankdan farq, so'm · ▲/▼ — o'zgarish")
+    lines.append("💳 — kartaga/hisobga oniy o'tkazma tizimlari kursi")
+    lines.append("💱 — bank ilovasidagi ayirboshlash kursi")
+    lines.append("🏦 — markaziy banklar rasmiy kursi")
 
     # Ma'lumot yo'q banklar — faqat UZS_RUB uchun, ixcham
     if no_entries and pair != "RUB_UZS":
@@ -302,6 +276,15 @@ def build_rates_message(pair: str, is_notification: bool = False) -> str:
         if len(no_entries) > 6:
             names += f" va yana {len(no_entries) - 6} ta"
         lines.append(f"\n<i>ℹ️ Ma'lumot yo'q: {names}</i>")
+
+    # Ajratuvchi chiziq + ogohlantirish (Curso uslubida)
+    lines.append("")
+    lines.append("--------------------------------")
+    lines.append(
+        "<i>O'tkazma xizmatlaridagi kurslar nashr vaqtidan o'tgan vaqt, "
+        "shaxsiy takliflar, akkaunt holati, promokodlar qo'llanishi va "
+        "boshqa sabablarga ko'ra farq qilishi mumkin.</i>"
+    )
 
     return "\n".join(lines)
 
